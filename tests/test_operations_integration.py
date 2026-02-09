@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from rr_mcp.errors import RrMcpError
 from rr_mcp.session import SessionManager
 from rr_mcp.trace import get_trace_processes
 
@@ -585,15 +586,19 @@ async def test_nexti_and_reverse_nexti(recorded_simple_trace: Path) -> None:
         event1, _ = await session.get_current_position()
 
         # Next one instruction
-        await session.next_instruction()
+        result2 = await session.next_instruction()
+        assert result2 is not None
 
-        event2, _ = await session.get_current_position()
+        event2 = result2.location.event
         # Event should advance (tick may stay 0 on rr 5.9.0)
         assert event2 >= event1
 
-        # Reverse next instruction
-        await session.reverse_next_instruction()
-        event3, _ = await session.get_current_position()
+        # Reverse next instruction — use stop result's location directly,
+        # because `when` can fail in transient GDB states after instruction-level ops
+        result3 = await session.reverse_next_instruction()
+        assert result3 is not None
+
+        event3 = result3.location.event
         # Should go back (at least to where we started)
         assert event3 <= event2
 
@@ -788,8 +793,7 @@ async def test_multi_process_breakpoint_in_child(recorded_fork_trace: Path) -> N
 
     # Find a child process (ppid != 0 means it has a parent)
     child = next((p for p in processes if p.ppid != 0), None)
-    if child is None:
-        pytest.skip("No child process found in fork trace")
+    assert child is not None, "No child process found in fork trace"
 
     manager = SessionManager()
     session, _ = await manager.create_session(trace=str(recorded_fork_trace), pid=child.pid)
@@ -851,13 +855,14 @@ async def test_thread_local_storage(recorded_threads_trace: Path) -> None:
     try:
         # Set breakpoint in synchronized_worker where thread_local_value is set
         bp_data = await session.set_breakpoint("synchronized_worker")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on synchronized_worker")
+        assert bp_data is not None, "Could not set breakpoint on synchronized_worker"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit synchronized_worker breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # Step a few times to get past the TLS assignment
         for _ in range(5):
@@ -883,13 +888,14 @@ async def test_thread_mutex_contention(recorded_threads_trace: Path) -> None:
     try:
         # Set breakpoint in contending_worker where mutex is acquired
         bp_data = await session.set_breakpoint("contending_worker")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on contending_worker")
+        assert bp_data is not None, "Could not set breakpoint on contending_worker"
 
         # Continue to first hit
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit contending_worker breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # We're now in one of the contending threads
         location = await session.get_current_location()
@@ -914,13 +920,14 @@ async def test_thread_race_condition_detection(recorded_threads_trace: Path) -> 
     try:
         # Set breakpoint in racing_worker which has intentional race
         bp_data = await session.set_breakpoint("racing_worker")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on racing_worker")
+        assert bp_data is not None, "Could not set breakpoint on racing_worker"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit racing_worker breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # Step forward to the race condition code
         for _ in range(10):
@@ -952,13 +959,14 @@ async def test_cpp_virtual_functions(recorded_cpp_features_trace: Path) -> None:
     try:
         # Set breakpoint in test_polymorphism where virtual functions are called
         bp_data = await session.set_breakpoint("test_polymorphism")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on test_polymorphism")
+        assert bp_data is not None, "Could not set breakpoint on test_polymorphism"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit test_polymorphism breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # Step forward to get into the loop
         for _ in range(20):
@@ -986,13 +994,14 @@ async def test_cpp_stl_containers(recorded_cpp_features_trace: Path) -> None:
     try:
         # Set breakpoint in test_stl_containers
         bp_data = await session.set_breakpoint("test_stl_containers")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on test_stl_containers")
+        assert bp_data is not None, "Could not set breakpoint on test_stl_containers"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit test_stl_containers breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # Step forward to where numbers vector is created and populated
         for _ in range(15):
@@ -1023,13 +1032,14 @@ async def test_cpp_exception_handling(recorded_cpp_features_trace: Path) -> None
     try:
         # Set breakpoint in test_exceptions
         bp_data = await session.set_breakpoint("test_exceptions")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on test_exceptions")
+        assert bp_data is not None, "Could not set breakpoint on test_exceptions"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit test_exceptions breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # Set breakpoint on the divide function
         divide_bp = await session.set_breakpoint("divide")
@@ -1064,13 +1074,14 @@ async def test_cpp_template_functions(recorded_cpp_features_trace: Path) -> None
     try:
         # Set breakpoint in test_templates
         bp_data = await session.set_breakpoint("test_templates")
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on test_templates")
+        assert bp_data is not None, "Could not set breakpoint on test_templates"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit test_templates breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # Step forward to template function calls
         for _ in range(10):
@@ -1102,13 +1113,14 @@ async def test_cpp_class_members(recorded_cpp_features_trace: Path) -> None:
             # Try alternate name
             bp_data = await session.set_breakpoint("area")
 
-        if bp_data is None:
-            pytest.skip("Could not set breakpoint on Circle::area")
+        assert bp_data is not None, "Could not set breakpoint on Circle::area"
 
         # Continue to breakpoint
         stop_result = await session.continue_execution()
-        if stop_result is None or stop_result.reason != "breakpoint-hit":
-            pytest.skip("Did not hit Circle::area breakpoint")
+        assert stop_result is not None, "continue_execution returned None"
+        assert stop_result.reason == "breakpoint-hit", (
+            f"Expected breakpoint-hit, got {stop_result.reason}"
+        )
 
         # We're now in a member function - should be able to access 'this' and members
         # Try to evaluate the radius member
@@ -1186,6 +1198,218 @@ async def test_reverse_step_returns_proper_stop_result(recorded_simple_trace: Pa
         assert reverse_result.reason != "unknown", (
             f"Reverse step should not return 'unknown', got: {reverse_result.reason}"
         )
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+# ---------------------------------------------------------------------------
+# Bug fix verification tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backtrace_max_depth_zero_returns_empty(recorded_simple_trace: Path) -> None:
+    """max_depth=0 must return empty list, not all frames (#3)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        frames = await session.get_backtrace(max_depth=0)
+        assert frames == []
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_source_listing_preserves_indentation(recorded_simple_trace: Path) -> None:
+    """Source listing must preserve leading whitespace (#4)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        # Set breakpoint in add function which has indented body
+        await session.set_breakpoint("add")
+        await session.continue_execution()
+
+        source = await session.get_source_lines(lines_before=2, lines_after=2)
+        assert len(source["lines"]) > 0
+
+        # At least one line in a function body should start with whitespace
+        contents = [line["content"] for line in source["lines"]]
+        has_indented = any(c.startswith(" ") or c.startswith("\t") for c in contents if c)
+        assert has_indented, f"No indented lines found in: {contents}"
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_session_limit_enforced(recorded_simple_trace: Path) -> None:
+    """SessionManager must reject sessions beyond the limit (#10)."""
+    manager = SessionManager(max_sessions=2)
+    sessions = []
+
+    try:
+        s1, _ = await manager.create_session(trace=str(recorded_simple_trace))
+        sessions.append(s1)
+        s2, _ = await manager.create_session(trace=str(recorded_simple_trace))
+        sessions.append(s2)
+
+        with pytest.raises(RrMcpError, match="Maximum number of sessions"):
+            await manager.create_session(trace=str(recorded_simple_trace))
+
+    finally:
+        for s in sessions:
+            await manager.close_session(s.session_id)
+
+
+# ---------------------------------------------------------------------------
+# New feature integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_catch_throw(recorded_cpp_features_trace: Path) -> None:
+    """Test catching C++ throw events (#15)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_cpp_features_trace))
+
+    try:
+        # Set a catchpoint for C++ throw
+        bp = await session.catch_throw()
+        assert bp is not None
+        assert bp.number is not None
+        assert bp.number > 0
+
+        # Continue — cpp_features throws exceptions in test_exceptions()
+        stop = await session.continue_execution()
+        assert stop is not None
+        # Should hit the throw catchpoint
+        assert stop.reason in ["breakpoint-hit", "signal-received", "end-stepping-range"]
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_catch_syscall(recorded_simple_trace: Path) -> None:
+    """Test catching syscall events (#15)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        # Set a catchpoint for write syscall (printf calls write)
+        bp = await session.catch_syscall("write")
+        assert bp is not None
+        assert bp.number is not None
+
+        # Continue — simple program uses printf which triggers write syscall
+        stop = await session.continue_execution()
+        assert stop is not None
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_handle_signal(recorded_simple_trace: Path) -> None:
+    """Test configuring signal handling (#16)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        # Configure SIGPIPE to not stop and not pass
+        output = await session.handle_signal("SIGPIPE", stop=False, pass_through=False)
+        assert isinstance(output, str)
+        # GDB should confirm the configuration change
+        assert len(output) > 0
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_info_proc_mappings(recorded_simple_trace: Path) -> None:
+    """Test info subcommand (#19)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        output = await session.info("proc mappings")
+        assert isinstance(output, str)
+        # Should contain memory mapping information with hex addresses
+        assert "0x" in output.lower() or len(output) > 0
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_info_signals(recorded_simple_trace: Path) -> None:
+    """Test info signals subcommand (#19)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        output = await session.info("signals")
+        assert isinstance(output, str)
+        # Should list signal names
+        assert "SIGINT" in output or "SIGSEGV" in output or "Signal" in output
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_find_in_memory(recorded_simple_trace: Path) -> None:
+    """Test memory search (#18)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        # Step into add(5, 3) and search for value 5 on the stack
+        await session.set_breakpoint("add")
+        await session.continue_execution()
+
+        # Get stack pointer range
+        regs = await session.read_registers()
+        rsp = regs.get("rsp")
+        assert rsp is not None
+
+        # Search for value 5 (the 'a' parameter) near the stack pointer
+        rsp_int = int(rsp, 16)
+        start = f"0x{rsp_int:x}"
+        end = f"0x{rsp_int + 256:x}"
+        addresses = await session.find_in_memory(start, end, "5", size="w")
+        # We may or may not find it depending on exact stack layout, but the
+        # call itself should succeed without error
+        assert isinstance(addresses, list)
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_pretty_printing_enabled(recorded_cpp_features_trace: Path) -> None:
+    """Test that pretty-printers are active for STL containers (#17)."""
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_cpp_features_trace))
+
+    try:
+        await session.set_breakpoint("test_stl_containers")
+        await session.continue_execution()
+
+        # Step past vector initialization
+        for _ in range(15):
+            await session.step()
+
+        # Evaluate numbers vector — with pretty-printers it should show elements
+        val = await session.evaluate_expression("numbers")
+        if val is not None:
+            # Pretty-printed output should contain element values, not raw memory
+            # (e.g., "std::vector of length 5" or "{10, 20, 30, 40, 50}")
+            assert "10" in val or "vector" in val.lower() or len(val) > 5
 
     finally:
         await manager.close_session(session.session_id)

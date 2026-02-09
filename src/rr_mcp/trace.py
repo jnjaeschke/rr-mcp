@@ -91,15 +91,11 @@ def list_traces() -> list[TraceSummary]:
         stat = entry.stat()
         created_at = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
 
-        # Calculate total size
-        size_bytes = sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
-
         traces.append(
             TraceSummary(
                 name=entry.name,
                 path=str(entry),
                 created_at=created_at,
-                size_bytes=size_bytes,
             )
         )
 
@@ -165,59 +161,6 @@ def get_trace_info(trace: str | None = None) -> TraceInfo:
     )
 
 
-def _get_process_event_ranges(trace_path: Path) -> dict[int, tuple[int, int]]:
-    """Get event ranges for each process in a trace.
-
-    Args:
-        trace_path: Path to the trace directory.
-
-    Returns:
-        Dictionary mapping PID to (event_start, event_end) tuple.
-    """
-    try:
-        # Use rr dump to get event information
-        # This is expensive but provides accurate event ranges
-        result = subprocess.run(
-            ["rr", "dump", str(trace_path), "-r"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,  # Prevent hanging on large traces
-        )
-        if result.returncode != 0:
-            # If dump fails, return empty dict (will use default values)
-            return {}
-
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return {}
-
-    # Parse dump output to extract process event ranges
-    # Format varies, but look for lines mentioning process/thread creation
-    pid_events: dict[int, list[int]] = {}
-
-    for line in result.stdout.splitlines():
-        # Look for event numbers and PIDs in the dump
-        # This is a simplified parser - real implementation may need adjustment
-        event_match = re.search(r"event:\s*(\d+)", line, re.IGNORECASE)
-        pid_match = re.search(r"pid[:\s]+(\d+)", line, re.IGNORECASE)
-
-        if event_match and pid_match:
-            event = int(event_match.group(1))
-            pid = int(pid_match.group(1))
-
-            if pid not in pid_events:
-                pid_events[pid] = []
-            pid_events[pid].append(event)
-
-    # Convert to ranges
-    ranges: dict[int, tuple[int, int]] = {}
-    for pid, events in pid_events.items():
-        if events:
-            ranges[pid] = (min(events), max(events))
-
-    return ranges
-
-
 def get_trace_processes(trace: str | None = None) -> list[ProcessInfo]:
     """Get all processes in a trace.
 
@@ -245,9 +188,6 @@ def get_trace_processes(trace: str | None = None) -> list[ProcessInfo]:
 
     except FileNotFoundError as err:
         raise RrCommandError("rr ps", "rr command not found", -1) from err
-
-    # Try to get event ranges (may be expensive for large traces)
-    event_ranges = _get_process_event_ranges(trace_path)
 
     processes: list[ProcessInfo] = []
 
@@ -289,9 +229,6 @@ def get_trace_processes(trace: str | None = None) -> list[ProcessInfo]:
         command = cmd_parts[0] if cmd_parts else ""
         args = cmd_parts[1:] if len(cmd_parts) > 1 else []
 
-        # Get event range for this process
-        event_start, event_end = event_ranges.get(pid, (0, 0))
-
         processes.append(
             ProcessInfo(
                 pid=pid,
@@ -299,8 +236,6 @@ def get_trace_processes(trace: str | None = None) -> list[ProcessInfo]:
                 exit_code=exit_code,
                 command=command,
                 args=tuple(args),
-                event_start=event_start,
-                event_end=event_end,
             )
         )
 

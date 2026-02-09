@@ -75,6 +75,35 @@ rr is a deterministic record-and-replay debugger. It records program execution o
 7. Repeat: set earlier breakpoints, reverse_continue, inspect
 ```
 
+### Workflow 5: Debugging C++ Exceptions
+
+```
+1. session_create → Start session
+2. catch event="throw" → Break on all C++ throws
+3. continue_ → Run until exception is thrown
+4. backtrace → See where exception originated
+5. locals / print → Inspect what was thrown and why
+6. reverse_step → Trace back to see what led to the throw
+```
+
+### Workflow 6: Tracing Syscalls or I/O
+
+```
+1. session_create → Start session
+2. catch event="syscall" filter="write" → Break on write syscalls
+3. continue_ → Run until write happens
+4. backtrace → See what code triggered the I/O
+5. args → Inspect syscall arguments (fd, buffer, size)
+```
+
+### Workflow 7: Suppressing Noisy Signals
+
+```
+1. session_create → Start session
+2. handle_signal signal="SIGPIPE" stop=false pass_through=false → Suppress SIGPIPE
+3. continue_ → Run without stopping on SIGPIPE
+```
+
 ## Tool Selection Guide
 
 ### When to Step vs Continue
@@ -204,13 +233,25 @@ print expression="my_var"                # Evaluate expression
 frame_select frame_num=1                 # Switch to caller frame
 ```
 
-### Breakpoints
+### Breakpoints & Catchpoints
 
 ```
 breakpoint_set location="func"           # Stop at function
 breakpoint_set location="file.cpp:42"    # Stop at line
 breakpoint_set location="func" condition="x>10"  # Conditional
 watchpoint_set expression="my_var" access_type="write"  # Stop on write
+catch event="throw"                      # Stop on C++ throw
+catch event="syscall" filter="write"     # Stop on write syscall
+```
+
+### Advanced
+
+```
+handle_signal signal="SIGPIPE" stop=false  # Suppress noisy signals
+find_in_memory start="$rsp" end="$rsp+256" pattern="0xdeadbeef"  # Search memory
+info subcommand="proc mappings"          # Memory layout
+info subcommand="shared"                 # Loaded libraries
+interrupt                                # Stop a running continue
 ```
 
 ### Cleanup

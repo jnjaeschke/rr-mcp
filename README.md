@@ -6,7 +6,7 @@ MCP (Model Context Protocol) server for orchestrating multi-process [rr](https:/
 
 rr-mcp enables AI agents (like Claude) to debug multi-process applications using rr's record-and-replay capabilities. It provides:
 
-- **43 specialized debugging tools** with rich descriptions and usage context
+- **48 specialized debugging tools** with rich descriptions and usage context
 - **Dynamic MCP resources** that expose live session state (`rr://sessions/{id}`)
 - **Concurrent replay sessions** for debugging different processes simultaneously
 - **Full reverse execution** - rr's killer feature for finding root causes
@@ -58,15 +58,16 @@ Claude will use the `traces_list` tool to show recordings in your `_RR_TRACE_DIR
 
 ### Available Tools & Resources
 
-**43 debugging tools** organized into categories. Each tool includes:
+**48 debugging tools** organized into categories. Each tool includes:
 
 - Rich descriptions with usage context
 - Parameter documentation with examples
 - Return value format specifications
 - Workflow guidance and best practices
 
-#### MCP Resources (Live State)
+#### MCP Resources
 
+- `rr://guide` - Debugging guide with workflows, tool selection advice, and common pitfalls
 - `rr://traces` - Dynamic list of available recordings
 - `rr://sessions/{id}` - Current session state (position, location)
 - `rr://sessions/{id}/backtrace` - Live call stack for a session
@@ -75,10 +76,11 @@ Claude will use the `traces_list` tool to show recordings in your `_RR_TRACE_DIR
 
 - **Trace Management** (3 tools): Discover and inspect recordings
 - **Session Lifecycle** (3 tools): Create and manage replay sessions
-- **Execution Control** (13 tools): Step, continue, finish (forward & reverse), run to event
-- **Breakpoints & Watchpoints** (6 tools): Set, list, enable, disable
+- **Execution Control** (14 tools): Step, continue, finish (forward & reverse), run to event, interrupt
+- **Breakpoints & Watchpoints** (7 tools): Set, list, enable, disable, catchpoints
 - **Inspection** (14 tools): Backtrace, locals, args, registers, memory, threads, checkpoints
-- **Source & Advanced** (4 tools): List source code, raw GDB commands
+- **Signal & Memory** (2 tools): Signal handling, memory search
+- **Source & Advanced** (5 tools): List source code, info queries, raw GDB commands
 
 All tools include detailed descriptions visible to Claude. See tool definitions in [src/rr_mcp/server.py](src/rr_mcp/server.py).
 
@@ -108,7 +110,10 @@ Agent: I want to find where this pointer became null.
 # Install dev dependencies
 uv sync --all-extras
 
-# Run tests
+# Run tests (parallel execution with pytest-xdist)
+uv run pytest -n auto
+
+# Run tests (sequential)
 uv run pytest
 
 # Run linter

@@ -61,28 +61,22 @@ def build_programs(programs_dir: Path) -> None:
         pytest.fail(f"Failed to build test programs:\n{result.stderr}")
 
 
-@pytest.fixture
-def temp_trace_dir() -> Iterator[Path]:
-    """Create a temporary directory for traces.
+# ---------------------------------------------------------------------------
+# Session-scoped trace directory and recorded traces (recorded once, reused)
+# ---------------------------------------------------------------------------
 
-    This overrides the default _RR_TRACE_DIR for the duration of the test.
+
+@pytest.fixture(scope="session")
+def session_trace_dir() -> Iterator[Path]:
+    """Session-scoped temp directory for recorded traces.
+
+    Traces are recorded once here and reused across all tests.
+    Does NOT set _RR_TRACE_DIR (that's test-specific).
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         trace_dir = Path(tmpdir) / "traces"
         trace_dir.mkdir()
-
-        # Set environment variable so rr uses our temp dir
-        old_trace_dir = os.environ.get("_RR_TRACE_DIR")
-        os.environ["_RR_TRACE_DIR"] = str(trace_dir)
-
-        try:
-            yield trace_dir
-        finally:
-            # Restore original environment
-            if old_trace_dir is not None:
-                os.environ["_RR_TRACE_DIR"] = old_trace_dir
-            elif "_RR_TRACE_DIR" in os.environ:
-                del os.environ["_RR_TRACE_DIR"]
+        yield trace_dir
 
 
 def record_trace(program_path: Path, trace_dir: Path, trace_name: str) -> Path:
@@ -134,73 +128,118 @@ def record_trace(program_path: Path, trace_dir: Path, trace_name: str) -> Path:
     return trace_path
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def recorded_crash_trace(
-    build_programs: None,  # Dependency to ensure programs are built
+    build_programs: None,
     programs_dir: Path,
-    temp_trace_dir: Path,
+    session_trace_dir: Path,
 ) -> Path:
-    """Record a trace of the crash program."""
+    """Record a trace of the crash program (once per session)."""
     program = programs_dir / "build" / "crash"
-    return record_trace(program, temp_trace_dir, "crash-trace")
+    return record_trace(program, session_trace_dir, "crash-trace")
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def recorded_simple_trace(
-    build_programs: None,  # Dependency to ensure programs are built
+    build_programs: None,
     programs_dir: Path,
-    temp_trace_dir: Path,
+    session_trace_dir: Path,
 ) -> Path:
-    """Record a trace of the simple program."""
+    """Record a trace of the simple program (once per session)."""
     program = programs_dir / "build" / "simple"
-    return record_trace(program, temp_trace_dir, "simple-trace")
+    return record_trace(program, session_trace_dir, "simple-trace")
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def recorded_threads_trace(
-    build_programs: None,  # Dependency to ensure programs are built
+    build_programs: None,
     programs_dir: Path,
-    temp_trace_dir: Path,
+    session_trace_dir: Path,
 ) -> Path:
-    """Record a trace of the threads program."""
+    """Record a trace of the threads program (once per session)."""
     program = programs_dir / "build" / "threads"
-    return record_trace(program, temp_trace_dir, "threads-trace")
+    return record_trace(program, session_trace_dir, "threads-trace")
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def recorded_recursive_trace(
-    build_programs: None,  # Dependency to ensure programs are built
+    build_programs: None,
     programs_dir: Path,
-    temp_trace_dir: Path,
+    session_trace_dir: Path,
 ) -> Path:
-    """Record a trace of the recursive program."""
+    """Record a trace of the recursive program (once per session)."""
     program = programs_dir / "build" / "recursive"
-    return record_trace(program, temp_trace_dir, "recursive-trace")
+    return record_trace(program, session_trace_dir, "recursive-trace")
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def recorded_fork_trace(
-    build_programs: None,  # Dependency to ensure programs are built
+    build_programs: None,
     programs_dir: Path,
-    temp_trace_dir: Path,
+    session_trace_dir: Path,
 ) -> Path:
-    """Record a trace of the fork_test program."""
+    """Record a trace of the fork_test program (once per session)."""
     program = programs_dir / "build" / "fork_test"
-    return record_trace(program, temp_trace_dir, "fork-trace")
+    return record_trace(program, session_trace_dir, "fork-trace")
+
+
+@pytest.fixture(scope="session")
+def recorded_cpp_features_trace(
+    build_programs: None,
+    programs_dir: Path,
+    session_trace_dir: Path,
+) -> Path:
+    """Record a trace of the cpp_features program (once per session)."""
+    program = programs_dir / "build" / "cpp_features"
+    return record_trace(program, session_trace_dir, "cpp-features-trace")
+
+
+# ---------------------------------------------------------------------------
+# Function-scoped fixture to set _RR_TRACE_DIR to the session trace dir.
+# Use this in tests that call list_traces() / resolve_trace_path() by name.
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def recorded_cpp_features_trace(
-    build_programs: None,  # Dependency to ensure programs are built
-    programs_dir: Path,
-    temp_trace_dir: Path,
-) -> Path:
-    """Record a trace of the cpp_features program."""
-    program = programs_dir / "build" / "cpp_features"
-    return record_trace(program, temp_trace_dir, "cpp-features-trace")
+def use_session_traces(session_trace_dir: Path) -> Iterator[Path]:
+    """Point _RR_TRACE_DIR at the session trace dir for one test."""
+    old = os.environ.get("_RR_TRACE_DIR")
+    os.environ["_RR_TRACE_DIR"] = str(session_trace_dir)
+    try:
+        yield session_trace_dir
+    finally:
+        if old is not None:
+            os.environ["_RR_TRACE_DIR"] = old
+        elif "_RR_TRACE_DIR" in os.environ:
+            del os.environ["_RR_TRACE_DIR"]
 
 
-# Fixtures for unit tests (mocked, no real rr)
+# ---------------------------------------------------------------------------
+# Function-scoped fixtures for unit tests (mocked, no real rr)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def temp_trace_dir() -> Iterator[Path]:
+    """Create a temporary EMPTY directory for traces.
+
+    Function-scoped for tests that need a clean/empty trace directory.
+    Sets _RR_TRACE_DIR for the duration of the test.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        trace_dir = Path(tmpdir) / "traces"
+        trace_dir.mkdir()
+
+        old_trace_dir = os.environ.get("_RR_TRACE_DIR")
+        os.environ["_RR_TRACE_DIR"] = str(trace_dir)
+
+        try:
+            yield trace_dir
+        finally:
+            if old_trace_dir is not None:
+                os.environ["_RR_TRACE_DIR"] = old_trace_dir
+            elif "_RR_TRACE_DIR" in os.environ:
+                del os.environ["_RR_TRACE_DIR"]
 
 
 @pytest.fixture

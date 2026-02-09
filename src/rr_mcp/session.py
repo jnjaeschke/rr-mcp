@@ -1,11 +1,13 @@
 """Session management for rr replay sessions."""
 
 import asyncio
+import logging
+import re
 import uuid
 
 from pygdbmi.gdbcontroller import GdbController
 
-from rr_mcp.errors import GdbError, SessionNotFoundError
+from rr_mcp.errors import GdbError, RrMcpError, SessionNotFoundError
 from rr_mcp.gdbmi import BreakpointData, GdbMi, GdbMiRecord, VariableData, _safe_int
 from rr_mcp.models import (
     BacktraceFrameDict,
@@ -19,6 +21,11 @@ from rr_mcp.models import (
     ThreadDict,
     VariableDict,
 )
+
+logger = logging.getLogger(__name__)
+
+# Default maximum number of concurrent sessions
+DEFAULT_MAX_SESSIONS = 10
 
 
 class Session:
@@ -34,7 +41,7 @@ class Session:
             trace: Path to the rr trace.
             pid: Process ID to debug (None for rr default).
         """
-        self.session_id: str = str(uuid.uuid4())[:8]
+        self.session_id: str = str(uuid.uuid4())
         self.trace: str = trace
         self.pid: int | None = pid
         self.state: SessionState = SessionState.PAUSED
@@ -64,11 +71,18 @@ class Session:
 
         self._gdb = GdbMi(controller)
 
-        # Flush initial GDB output by executing a harmless command
-        await self._read_until_ready()
+        try:
+            # Flush initial GDB output by executing a harmless command
+            await self._read_until_ready()
 
-        # Get initial location
-        return await self.get_current_location()
+            # Enable pretty-printers for STL containers etc.
+            await self._gdb.enable_pretty_printing()
+
+            # Get initial location
+            return await self.get_current_location()
+        except Exception:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         """Close the session and terminate the rr process."""
@@ -132,7 +146,7 @@ class Session:
             function=frame.function if frame else None,
             file=frame.file if frame else None,
             line=frame.line if frame else None,
-            address=frame.address or "0x0" if frame else "0x0",
+            address=(frame.address or "0x0") if frame else "0x0",
         )
 
     def _has_stopped_notification(self, records: list[GdbMiRecord]) -> bool:
@@ -149,6 +163,19 @@ class Session:
             and record.get("message") in ("stopped", "thread-exited", "exited")
             for record in records
         )
+
+    async def _exec_and_wait(
+        self, response: list[GdbMiRecord], timeout_sec: int = 30
+    ) -> StopResult | None:
+        """Wait for stop notification if needed, then parse the stop result.
+
+        All GDB exec commands can be asynchronous (returning ^running first).
+        This method ensures we always wait for the actual stop notification.
+        """
+        if self._gdb is not None and not self._has_stopped_notification(response):
+            stop_response = await self._gdb._wait_for_stop(timeout_sec=timeout_sec)
+            response.extend(stop_response)
+        return await self._parse_stop_result(response)
 
     async def _parse_stop_result(self, records: list[GdbMiRecord]) -> StopResult | None:
         """Parse a stop result from GDB/MI records and populate event/tick.
@@ -168,8 +195,12 @@ class Session:
             ):
                 payload = record.get("payload", {})
 
-                # Get current position
-                event, tick = await self.get_current_position()
+                # Get current position — may fail in transient GDB states
+                try:
+                    event, tick = await self.get_current_position()
+                except GdbError:
+                    logger.debug("_parse_stop_result: rr when failed, using (0,0)")
+                    event, tick = 0, 0
 
                 # Extract signal info if present
                 signal_info = None
@@ -211,7 +242,11 @@ class Session:
 
                 # Only create StopResult if we have frame information
                 if frame:
-                    event, tick = await self.get_current_position()
+                    try:
+                        event, tick = await self.get_current_position()
+                    except GdbError:
+                        logger.debug("_parse_stop_result: rr when failed (done), using (0,0)")
+                        event, tick = 0, 0
                     return StopResult(
                         reason="end-stepping-range",
                         location=Location(
@@ -233,237 +268,111 @@ class Session:
     # -------------------------------------------------------------------------
 
     async def step(self, count: int = 1) -> StopResult | None:
-        """Step forward by source lines (into functions).
-
-        Args:
-            count: Number of steps.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step forward by source lines (into functions)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_step(count=count)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def reverse_step(self, count: int = 1) -> StopResult | None:
-        """Step backward by source lines (into functions).
-
-        Args:
-            count: Number of steps.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step backward by source lines (into functions)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_step(count=count, reverse=True)
-        # Reverse operations are async - wait for stopped notification if not already present
-        if not self._has_stopped_notification(response):
-            stop_response = await self._gdb._wait_for_stop()
-            response.extend(stop_response)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def next(self, count: int = 1) -> StopResult | None:
-        """Step forward by source lines (over functions).
-
-        Args:
-            count: Number of steps.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step forward by source lines (over functions)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_next(count=count)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def reverse_next(self, count: int = 1) -> StopResult | None:
-        """Step backward by source lines (over functions).
-
-        Args:
-            count: Number of steps.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step backward by source lines (over functions)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_next(count=count, reverse=True)
-        # Reverse operations are async - wait for stopped notification if not already present
-        if not self._has_stopped_notification(response):
-            stop_response = await self._gdb._wait_for_stop()
-            response.extend(stop_response)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
-    async def continue_execution(self) -> StopResult | None:
-        """Continue execution forward until breakpoint or end.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+    async def continue_execution(self, timeout_sec: int = 30) -> StopResult | None:
+        """Continue execution forward until breakpoint or end."""
         if self._gdb is None:
             return None
-        self.state = SessionState.RUNNING
+        # exec_continue returns quickly (^running), the real wait is in _exec_and_wait
         response = await self._gdb.exec_continue()
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response, timeout_sec=timeout_sec)
 
-    async def reverse_continue(self) -> StopResult | None:
-        """Continue execution backward until breakpoint or beginning.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+    async def reverse_continue(self, timeout_sec: int = 30) -> StopResult | None:
+        """Continue execution backward until breakpoint or beginning."""
         if self._gdb is None:
             return None
-        self.state = SessionState.RUNNING
+        # exec_continue returns quickly (^running), the real wait is in _exec_and_wait
         response = await self._gdb.exec_continue(reverse=True)
-        # Reverse operations are async - wait for stopped notification if not already present
-        if not self._has_stopped_notification(response):
-            stop_response = await self._gdb._wait_for_stop()
-            response.extend(stop_response)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response, timeout_sec=timeout_sec)
 
     async def finish(self) -> StopResult | None:
-        """Finish executing current function (step out).
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Finish executing current function (step out)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.RUNNING
         response = await self._gdb.exec_finish()
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def reverse_finish(self) -> StopResult | None:
-        """Reverse to the start of current function (reverse step out).
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Reverse to the start of current function (reverse step out)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.RUNNING
         response = await self._gdb.exec_finish(reverse=True)
-        # Reverse operations are async - wait for stopped notification if not already present
-        if not self._has_stopped_notification(response):
-            stop_response = await self._gdb._wait_for_stop()
-            response.extend(stop_response)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def step_instruction(self, count: int = 1) -> StopResult | None:
-        """Step forward by machine instructions (into calls).
-
-        Args:
-            count: Number of instructions.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step forward by machine instructions (into calls)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_step_instruction(count=count)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def reverse_step_instruction(self, count: int = 1) -> StopResult | None:
-        """Step backward by machine instructions (into calls).
-
-        Args:
-            count: Number of instructions.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step backward by machine instructions (into calls)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_step_instruction(count=count, reverse=True)
-        # Reverse operations are async - wait for stopped notification if not already present
-        if not self._has_stopped_notification(response):
-            stop_response = await self._gdb._wait_for_stop()
-            response.extend(stop_response)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def next_instruction(self, count: int = 1) -> StopResult | None:
-        """Step forward by machine instructions (over calls).
-
-        Args:
-            count: Number of instructions.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step forward by machine instructions (over calls)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_next_instruction(count=count)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def reverse_next_instruction(self, count: int = 1) -> StopResult | None:
-        """Step backward by machine instructions (over calls).
-
-        Args:
-            count: Number of instructions.
-
-        Returns:
-            StopResult if execution stopped, None otherwise.
-        """
+        """Step backward by machine instructions (over calls)."""
         if self._gdb is None:
             return None
-        self.state = SessionState.STEPPING
         response = await self._gdb.exec_next_instruction(count=count, reverse=True)
-        # Reverse operations are async - wait for stopped notification if not already present
-        if not self._has_stopped_notification(response):
-            stop_response = await self._gdb._wait_for_stop()
-            response.extend(stop_response)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        return await self._exec_and_wait(response)
 
     async def run_to_event(self, event: int) -> StopResult | None:
-        """Run to a specific event number in the trace.
+        """Run to a specific event number in the trace."""
+        if self._gdb is None:
+            return None
+        response = await self._gdb.rr_run_to_event(event)
+        return await self._exec_and_wait(response)
 
-        Args:
-            event: The target event number.
+    async def interrupt(self) -> StopResult | None:
+        """Interrupt a running program.
+
+        Sends -exec-interrupt to stop the inferior. Useful when the program
+        is running (e.g., during a long continue) and needs to be stopped.
 
         Returns:
-            StopResult when stopped at or near the target event.
+            StopResult if the program was interrupted, None if session is inactive.
         """
         if self._gdb is None:
             return None
-        self.state = SessionState.RUNNING
-        response = await self._gdb.rr_run_to_event(event)
-        result = await self._parse_stop_result(response)
-        self.state = SessionState.PAUSED
-        return result
+        response = await self._gdb.exec_interrupt()
+        return await self._exec_and_wait(response, timeout_sec=5)
 
     # -------------------------------------------------------------------------
     # Breakpoints
@@ -556,6 +465,60 @@ class Session:
         return await self._gdb.break_watch(expression, access_type)
 
     # -------------------------------------------------------------------------
+    # Catch events
+    # -------------------------------------------------------------------------
+
+    async def catch_throw(self) -> BreakpointData | None:
+        """Set a catchpoint for C++ throw events."""
+        if self._gdb is None:
+            return None
+        return await self._gdb.catch_throw()
+
+    async def catch_catch(self) -> BreakpointData | None:
+        """Set a catchpoint for C++ catch events."""
+        if self._gdb is None:
+            return None
+        return await self._gdb.catch_catch()
+
+    async def catch_syscall(self, syscall: str | None = None) -> BreakpointData | None:
+        """Set a catchpoint for syscall events."""
+        if self._gdb is None:
+            return None
+        return await self._gdb.catch_syscall(syscall)
+
+    async def catch_signal(self, signal: str | None = None) -> BreakpointData | None:
+        """Set a catchpoint for signal events."""
+        if self._gdb is None:
+            return None
+        return await self._gdb.catch_signal(signal)
+
+    # -------------------------------------------------------------------------
+    # Signal handling
+    # -------------------------------------------------------------------------
+
+    async def handle_signal(
+        self,
+        signal: str,
+        stop: bool | None = None,
+        pass_through: bool | None = None,
+        print_signal: bool | None = None,
+    ) -> str:
+        """Configure how GDB handles a signal.
+
+        Args:
+            signal: Signal name (e.g., "SIGPIPE", "SIGUSR1", "all").
+            stop: Whether to stop on this signal.
+            pass_through: Whether to pass the signal to the program.
+            print_signal: Whether to print when the signal is received.
+
+        Returns:
+            The GDB console output describing the new configuration.
+        """
+        if self._gdb is None:
+            return ""
+        return await self._gdb.handle_signal(signal, stop, pass_through, print_signal)
+
+    # -------------------------------------------------------------------------
     # Stack navigation
     # -------------------------------------------------------------------------
 
@@ -565,7 +528,7 @@ class Session:
         """Get the call stack backtrace.
 
         Args:
-            max_depth: Maximum number of frames to return (None for all).
+            max_depth: Maximum number of frames to return (None for all, 0 for none).
             full: If True, include local variables for each frame.
 
         Returns:
@@ -574,7 +537,12 @@ class Session:
         if self._gdb is None:
             return []
 
-        end = max_depth - 1 if max_depth else None
+        if max_depth is not None:
+            if max_depth <= 0:
+                return []
+            end: int | None = max_depth - 1
+        else:
+            end = None
         frames = await self._gdb.stack_list_frames(start=0, end=end)
 
         # Convert to dict format
@@ -700,6 +668,42 @@ class Session:
             return None
         return await self._gdb.data_evaluate_expression(expression)
 
+    async def find_in_memory(
+        self, start: str, end: str, pattern: str, size: str | None = None
+    ) -> list[str]:
+        """Search memory for a byte pattern.
+
+        Args:
+            start: Start address (hex string or expression).
+            end: End address (hex string or expression).
+            pattern: Search pattern (hex bytes, string, or expression).
+            size: Optional unit size: b, h, w, or g.
+
+        Returns:
+            List of addresses where the pattern was found.
+        """
+        if self._gdb is None:
+            return []
+        return await self._gdb.find_in_memory(start, end, pattern, size)
+
+    # -------------------------------------------------------------------------
+    # Info commands
+    # -------------------------------------------------------------------------
+
+    async def info(self, subcommand: str) -> str:
+        """Run a GDB 'info' subcommand.
+
+        Args:
+            subcommand: The info subcommand (e.g., "proc mappings", "shared",
+                        "symbol 0x12345", "types", "signals").
+
+        Returns:
+            Console output from the command.
+        """
+        if self._gdb is None:
+            return ""
+        return await self._gdb.info_command(subcommand)
+
     # -------------------------------------------------------------------------
     # Checkpoints
     # -------------------------------------------------------------------------
@@ -759,9 +763,6 @@ class Session:
                     continue
                 output = payload
                 for line in output.splitlines():
-                    # Try to match with tick first
-                    import re
-
                     match = re.match(r"\s*(\d+)\s+.*event\s+(\d+).*tick\s+(\d+)", line)
                     if match:
                         checkpoints.append(
@@ -906,19 +907,17 @@ class Session:
                         error=f"Invalid line number in location: {location}",
                     )
             else:
-                # It's a function name - need to resolve it
-                # For now, use current location as fallback
-                curr_loc = await self.get_current_location()
-                if curr_loc.file is None or curr_loc.line is None:
+                # It's a function name - resolve via GDB
+                resolved = await self._gdb.resolve_function_location(location)
+                if resolved is None:
                     return SourceLinesDict(
                         file=None,
                         start_line=0,
                         lines=[],
                         current_line=None,
-                        error=f"Cannot resolve location: {location}",
+                        error=f"Cannot resolve function: {location}",
                     )
-                filename = curr_loc.file
-                center_line = curr_loc.line
+                filename, center_line = resolved
 
         # Calculate line range
         start_line = max(1, center_line - lines_before)
@@ -941,9 +940,14 @@ class Session:
 class SessionManager:
     """Manages multiple rr replay sessions."""
 
-    def __init__(self) -> None:
-        """Initialize the session manager."""
+    def __init__(self, max_sessions: int = DEFAULT_MAX_SESSIONS) -> None:
+        """Initialize the session manager.
+
+        Args:
+            max_sessions: Maximum number of concurrent sessions allowed.
+        """
         self._sessions: dict[str, Session] = {}
+        self._max_sessions = max_sessions
 
     def list_sessions(self) -> list[Session]:
         """List all active sessions.
@@ -983,7 +987,16 @@ class SessionManager:
 
         Returns:
             Tuple of (session, initial_location).
+
+        Raises:
+            RrMcpError: If the maximum number of sessions is reached.
         """
+        if len(self._sessions) >= self._max_sessions:
+            raise RrMcpError(
+                f"Maximum number of sessions ({self._max_sessions}) reached. "
+                "Close an existing session before creating a new one."
+            )
+
         session = Session(trace=trace, pid=pid)
         initial_location = await session.start()
         self._sessions[session.session_id] = session

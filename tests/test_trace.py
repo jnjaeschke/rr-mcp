@@ -94,7 +94,6 @@ class TestListTraces:
         assert len(result) == 1
         assert result[0].name == "test-trace-0"
         assert result[0].path == str(fake_trace)
-        assert result[0].size_bytes > 0
 
     def test_multiple_traces_sorted_by_time(self, mock_rr_dir: Path) -> None:
         """Should return traces sorted by creation time (newest first)."""

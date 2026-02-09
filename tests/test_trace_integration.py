@@ -18,7 +18,9 @@ def test_list_traces_empty(temp_trace_dir: Path) -> None:  # noqa: ARG001
     assert traces == []
 
 
-def test_list_traces_with_recording(recorded_simple_trace: Path) -> None:
+def test_list_traces_with_recording(
+    recorded_simple_trace: Path, use_session_traces: Path  # noqa: ARG001
+) -> None:
     """Test listing traces after recording."""
     traces = list_traces()
     assert len(traces) >= 1
@@ -30,7 +32,6 @@ def test_list_traces_with_recording(recorded_simple_trace: Path) -> None:
     # Check trace has metadata
     simple_trace = next(t for t in traces if t.name == "simple-trace")
     assert simple_trace.path == str(recorded_simple_trace)
-    assert simple_trace.size_bytes > 0
     assert simple_trace.created_at is not None
 
 
@@ -40,7 +41,9 @@ def test_resolve_trace_path_absolute(recorded_simple_trace: Path) -> None:
     assert resolved == recorded_simple_trace
 
 
-def test_resolve_trace_path_by_name(recorded_simple_trace: Path) -> None:
+def test_resolve_trace_path_by_name(
+    recorded_simple_trace: Path, use_session_traces: Path  # noqa: ARG001
+) -> None:
     """Test resolving a trace by name."""
     resolved = resolve_trace_path("simple-trace")
     assert resolved == recorded_simple_trace

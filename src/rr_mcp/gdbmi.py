@@ -5,7 +5,9 @@ providing a clean Python API that hides the protocol details.
 """
 
 import asyncio
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
@@ -13,6 +15,8 @@ from pygdbmi.gdbcontroller import GdbController
 
 if TYPE_CHECKING:
     from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # GDB/MI response record types
@@ -132,37 +136,109 @@ class GdbMi:
         This is needed for asynchronous operations (like reverse commands) that
         return "running" immediately but send "stopped" later.
 
+        Loops reading GDB responses until a stop-like notification is found,
+        since GDB may send console output or other records before the stop.
+
+        On timeout, sends -exec-interrupt to bring GDB back to a stopped state
+        so the session remains usable.
+
         Args:
             timeout_sec: Timeout in seconds.
 
         Returns:
             List of GDB/MI response records up to and including the stop.
         """
-        async with self._lock:
-            loop = asyncio.get_running_loop()
-            # Read responses until we get a stopped notification
-            result = await loop.run_in_executor(
-                None,
-                lambda: self._gdb.get_gdb_response(
-                    timeout_sec=timeout_sec, raise_error_on_timeout=True
-                ),
+        all_records: list[GdbMiRecord] = []
+        stop_messages = {"stopped", "thread-exited", "exited"}
+        deadline = time.monotonic() + timeout_sec
+
+        def _has_stop(records: list[GdbMiRecord]) -> bool:
+            return any(
+                r.get("type") == "notify" and r.get("message") in stop_messages for r in records
             )
-            return result  # type: ignore[return-value]
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            async with self._lock:
+                loop = asyncio.get_running_loop()
+                read_timeout = max(1, int(remaining))
+
+                def _read(timeout: int = read_timeout) -> list[GdbMiRecord]:
+                    return self._gdb.get_gdb_response(  # type: ignore[return-value]
+                        timeout_sec=timeout,
+                        raise_error_on_timeout=True,
+                    )
+
+                try:
+                    records: list[GdbMiRecord] = await loop.run_in_executor(None, _read)
+                except Exception:
+                    logger.debug("_wait_for_stop: read interrupted", exc_info=True)
+                    break
+
+            all_records.extend(records)
+
+            if _has_stop(records):
+                return all_records
+
+        # Timeout expired without stop — send interrupt to recover the session
+        logger.warning("_wait_for_stop: timeout after %ds, sending -exec-interrupt", timeout_sec)
+        try:
+            interrupt_records = await self.exec_interrupt()
+            all_records.extend(interrupt_records)
+
+            # Wait briefly for the stop notification from the interrupt
+            interrupt_deadline = time.monotonic() + 5
+            while time.monotonic() < interrupt_deadline:
+                async with self._lock:
+                    loop = asyncio.get_running_loop()
+
+                    def _read_interrupt() -> list[GdbMiRecord]:
+                        return self._gdb.get_gdb_response(  # type: ignore[return-value]
+                            timeout_sec=2,
+                            raise_error_on_timeout=True,
+                        )
+
+                    try:
+                        stop_records = await loop.run_in_executor(None, _read_interrupt)
+                    except Exception:
+                        break
+
+                all_records.extend(stop_records)
+                if _has_stop(stop_records):
+                    break
+        except Exception:
+            logger.debug("_wait_for_stop: interrupt failed", exc_info=True)
+
+        return all_records
 
     async def close(self) -> None:
         """Close the GDB connection."""
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._gdb.exit)
 
+    async def exec_interrupt(self) -> list[GdbMiRecord]:
+        """Send an interrupt to stop the running program.
+
+        Returns:
+            GDB/MI response records.
+        """
+        return await self.execute_raw("-exec-interrupt", timeout_sec=5)
+
     # -------------------------------------------------------------------------
     # Execution control
     # -------------------------------------------------------------------------
 
-    async def exec_continue(self, reverse: bool = False) -> list[GdbMiRecord]:
+    async def exec_continue(
+        self, reverse: bool = False, timeout_sec: int = 30
+    ) -> list[GdbMiRecord]:
         """Continue execution.
 
         Args:
             reverse: If True, continue backward.
+            timeout_sec: Timeout in seconds.
 
         Returns:
             GDB/MI response records (caller should parse for stop event).
@@ -170,7 +246,7 @@ class GdbMi:
         cmd = "-exec-continue"
         if reverse:
             cmd += " --reverse"
-        return await self.execute_raw(cmd)
+        return await self.execute_raw(cmd, timeout_sec=timeout_sec)
 
     async def exec_step(self, count: int = 1, reverse: bool = False) -> list[GdbMiRecord]:
         """Step by source lines (into functions).
@@ -259,8 +335,19 @@ class GdbMi:
 
         Returns:
             Tuple of (event, tick).
+
+        Raises:
+            GdbError: If the command fails with an error response.
         """
+        from rr_mcp.errors import GdbError
+
         response = await self.execute_raw('-interpreter-exec console "when"')
+
+        # Check for GDB error responses
+        for record in response:
+            if record.get("type") == "result" and record.get("message") == "error":
+                error_msg = record.get("payload", {}).get("msg", "unknown error")
+                raise GdbError(f"rr when command failed: {error_msg}")
 
         for record in response:
             if record.get("type") == "console":
@@ -275,6 +362,7 @@ class GdbMi:
                     tick = int(tick_match.group(1)) if tick_match else 0
                     return (event, tick)
 
+        logger.warning("rr_when: could not parse event/tick from response: %s", response)
         return (0, 0)
 
     async def rr_run_to_event(self, event: int) -> list[GdbMiRecord]:
@@ -366,7 +454,7 @@ class GdbMi:
         if temporary:
             cmd += " -t"
         if condition:
-            cmd += f' -c "{condition}"'
+            cmd += f' -c "{_mi_escape(condition)}"'
         cmd += f" {location}"
 
         response = await self.execute_raw(cmd)
@@ -479,7 +567,11 @@ class GdbMi:
             )
 
         type_flag = type_map[access_type]
-        cmd = f"-break-watch {type_flag} {expression}".strip()
+        parts = ["-break-watch"]
+        if type_flag:
+            parts.append(type_flag)
+        parts.append(expression)
+        cmd = " ".join(parts)
 
         response = await self.execute_raw(cmd)
 
@@ -654,7 +746,8 @@ class GdbMi:
         Returns:
             String value, or None if failed.
         """
-        response = await self.execute_raw(f'-data-evaluate-expression "{expression}"')
+        escaped = _mi_escape(expression)
+        response = await self.execute_raw(f'-data-evaluate-expression "{escaped}"')
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
@@ -704,7 +797,8 @@ class GdbMi:
         size = size_map.get(unit_size, "w")
 
         # Use console x command (no direct MI equivalent)
-        cmd = f'-interpreter-exec console "x/{count}{format_char}{size} {address}"'
+        escaped_addr = _mi_escape(address)
+        cmd = f'-interpreter-exec console "x/{count}{format_char}{size} {escaped_addr}"'
         response = await self.execute_raw(cmd)
 
         results: list[tuple[str, str]] = []
@@ -893,8 +987,9 @@ class GdbMi:
             List of (line_number, content) tuples.
         """
         # GDB doesn't have a direct MI command for this, use console
+        escaped_filename = _mi_escape(filename)
         response = await self.execute_raw(
-            f'-interpreter-exec console "list {filename}:{start_line},{end_line}"'
+            f'-interpreter-exec console "list {escaped_filename}:{start_line},{end_line}"'
         )
 
         lines = []
@@ -906,8 +1001,8 @@ class GdbMi:
                 output = payload
                 # Parse output like "123\tcode here"
                 for line in output.splitlines():
-                    # Look for line numbers at start
-                    match = re.match(r"(\d+)\s+(.*)", line)
+                    # Match line number + tab separator (preserving indentation in content)
+                    match = re.match(r"(\d+)\t(.*)", line)
                     if match:
                         line_num = int(match.group(1))
                         content = match.group(2)
@@ -942,6 +1037,231 @@ class GdbMi:
 
         # Fallback: return as-is
         return filename
+
+    async def resolve_function_location(self, function_name: str) -> tuple[str, int] | None:
+        """Resolve a function name to its file and line number.
+
+        Args:
+            function_name: Function name to look up.
+
+        Returns:
+            Tuple of (filename, line_number), or None if cannot be resolved.
+        """
+        escaped = _mi_escape(function_name)
+        response = await self.execute_raw(f'-interpreter-exec console "info line {escaped}"')
+        for record in response:
+            if record.get("type") == "console":
+                payload = record.get("payload", "")
+                if not isinstance(payload, str):
+                    continue
+                # Parse: Line 42 of "filename.cpp" starts at address ...
+                match = re.search(r'Line (\d+) of "([^"]+)"', payload)
+                if match:
+                    return (match.group(2), int(match.group(1)))
+        return None
+
+    # -------------------------------------------------------------------------
+    # Pretty-printing
+    # -------------------------------------------------------------------------
+
+    async def enable_pretty_printing(self) -> None:
+        """Enable GDB pretty-printers for STL containers, smart pointers, etc."""
+        await self.execute_raw("-enable-pretty-printing")
+        await self.execute_raw('-interpreter-exec console "set print pretty on"')
+
+    # -------------------------------------------------------------------------
+    # Catch events
+    # -------------------------------------------------------------------------
+
+    async def catch_throw(self) -> BreakpointData | None:
+        """Set a catchpoint for C++ throw events.
+
+        Returns:
+            Breakpoint data for the catchpoint, or None if failed.
+        """
+        return await self._catch_event("catch throw")
+
+    async def catch_catch(self) -> BreakpointData | None:
+        """Set a catchpoint for C++ catch events.
+
+        Returns:
+            Breakpoint data for the catchpoint, or None if failed.
+        """
+        return await self._catch_event("catch catch")
+
+    async def catch_syscall(self, syscall: str | None = None) -> BreakpointData | None:
+        """Set a catchpoint for syscall events.
+
+        Args:
+            syscall: Specific syscall name or number, or None for all syscalls.
+
+        Returns:
+            Breakpoint data for the catchpoint, or None if failed.
+        """
+        cmd = "catch syscall"
+        if syscall:
+            cmd += f" {_mi_escape(syscall)}"
+        return await self._catch_event(cmd)
+
+    async def catch_signal(self, signal: str | None = None) -> BreakpointData | None:
+        """Set a catchpoint for signal events.
+
+        Args:
+            signal: Specific signal name, or None for all signals.
+
+        Returns:
+            Breakpoint data for the catchpoint, or None if failed.
+        """
+        cmd = "catch signal"
+        if signal:
+            cmd += f" {_mi_escape(signal)}"
+        return await self._catch_event(cmd)
+
+    async def _catch_event(self, catch_cmd: str) -> BreakpointData | None:
+        """Execute a catch command and parse the resulting catchpoint.
+
+        Args:
+            catch_cmd: The catch command (e.g., "catch throw").
+
+        Returns:
+            Breakpoint data for the catchpoint, or None if failed.
+        """
+        escaped = _mi_escape(catch_cmd)
+        response = await self.execute_raw(f'-interpreter-exec console "{escaped}"')
+
+        # Parse console output for catchpoint number
+        for record in response:
+            if record.get("type") == "console":
+                payload = record.get("payload", "")
+                if not isinstance(payload, str):
+                    continue
+                # Parse: "Catchpoint N (throw)" or "Catchpoint N (syscall ...)"
+                match = re.search(r"[Cc]atchpoint\s+(\d+)", payload)
+                if match:
+                    return BreakpointData(
+                        number=int(match.group(1)),
+                        type="catchpoint",
+                        enabled=True,
+                        address=None,
+                        file=None,
+                        line=None,
+                        function=None,
+                        condition=None,
+                        times=0,
+                    )
+        return None
+
+    # -------------------------------------------------------------------------
+    # Signal handling
+    # -------------------------------------------------------------------------
+
+    async def handle_signal(
+        self,
+        signal: str,
+        stop: bool | None = None,
+        pass_through: bool | None = None,
+        print_signal: bool | None = None,
+    ) -> str:
+        """Configure how GDB handles a signal.
+
+        Args:
+            signal: Signal name (e.g., "SIGPIPE", "SIGUSR1", "all").
+            stop: Whether to stop on this signal.
+            pass_through: Whether to pass the signal to the program.
+            print_signal: Whether to print when the signal is received.
+
+        Returns:
+            The GDB console output describing the new configuration.
+        """
+        parts = ["handle", signal]
+        if stop is True:
+            parts.append("stop")
+        elif stop is False:
+            parts.append("nostop")
+        if pass_through is True:
+            parts.append("pass")
+        elif pass_through is False:
+            parts.append("nopass")
+        if print_signal is True:
+            parts.append("print")
+        elif print_signal is False:
+            parts.append("noprint")
+
+        cmd = " ".join(parts)
+        escaped = _mi_escape(cmd)
+        response = await self.execute_raw(f'-interpreter-exec console "{escaped}"')
+        return _extract_console_output(response)
+
+    # -------------------------------------------------------------------------
+    # Memory search
+    # -------------------------------------------------------------------------
+
+    async def find_in_memory(
+        self,
+        start: str,
+        end: str,
+        pattern: str,
+        size: str | None = None,
+    ) -> list[str]:
+        """Search memory for a byte pattern.
+
+        Args:
+            start: Start address (hex string or expression).
+            end: End address (hex string or expression).
+            pattern: Search pattern (hex bytes, string, or expression).
+            size: Optional unit size: /b (byte), /h (halfword), /w (word), /g (giant).
+
+        Returns:
+            List of addresses where the pattern was found.
+        """
+        size_spec = f"/{size}" if size else ""
+        cmd = f"find {size_spec} {start}, {end}, {pattern}"
+        escaped = _mi_escape(cmd)
+        response = await self.execute_raw(f'-interpreter-exec console "{escaped}"')
+
+        addresses: list[str] = []
+        output = _extract_console_output(response)
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("0x"):
+                # Extract just the address (may have additional info after it)
+                addr = line.split()[0] if line.split() else line
+                addresses.append(addr)
+        return addresses
+
+    # -------------------------------------------------------------------------
+    # Info commands
+    # -------------------------------------------------------------------------
+
+    async def info_command(self, subcommand: str) -> str:
+        """Run an arbitrary GDB 'info' subcommand.
+
+        Args:
+            subcommand: The info subcommand (e.g., "proc mappings", "shared",
+                        "symbol 0x12345", "types", "signals").
+
+        Returns:
+            The console output.
+        """
+        escaped = _mi_escape(f"info {subcommand}")
+        response = await self.execute_raw(f'-interpreter-exec console "{escaped}"')
+        return _extract_console_output(response)
+
+
+def _extract_console_output(records: list[GdbMiRecord]) -> str:
+    """Extract and join all console output from GDB/MI response records."""
+    lines: list[str] = []
+    for record in records:
+        if record.get("type") == "console":
+            payload = record.get("payload", "")
+            if isinstance(payload, str):
+                lines.append(payload)
+    return "".join(lines)
+
+
+def _mi_escape(s: str) -> str:
+    """Escape a string for use inside GDB/MI double-quoted arguments."""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _safe_int(value: object) -> int | None:

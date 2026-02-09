@@ -13,7 +13,6 @@ class TraceSummary:
     name: str
     path: str
     created_at: datetime
-    size_bytes: int
 
 
 @dataclass(frozen=True)
@@ -36,21 +35,16 @@ class ProcessInfo:
     exit_code: int | None
     command: str
     args: tuple[str, ...]
-    event_start: int
-    event_end: int
 
 
 class SessionState(Enum):
     """State of a replay session.
 
-    Note: With the current synchronous GDB/MI architecture, sessions are always
-    in PAUSED state when accessible to clients (commands block until completion).
-    RUNNING and STEPPING would only be meaningful with async execution.
+    All GDB/MI operations block until completion (run_in_executor), so sessions
+    are always PAUSED when accessible to clients.
     """
 
     PAUSED = "paused"
-    RUNNING = "running"  # Currently unused (synchronous execution)
-    STEPPING = "stepping"  # Currently unused (synchronous execution)
     CLOSED = "closed"
 
 
@@ -220,10 +214,3 @@ class ErrorInfoDict(TypedDict, total=False):
     message: str
     trace: str  # Optional, for TraceNotFoundError
     session_id: str  # Optional, for SessionNotFoundError
-
-
-class ErrorResponseDict(TypedDict):
-    """Error response as JSON dict."""
-
-    success: bool
-    error: ErrorInfoDict
