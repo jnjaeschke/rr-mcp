@@ -14,48 +14,47 @@ rr-mcp enables AI agents (like Claude) to debug multi-process applications using
 
 **New to rr debugging?** See [RR_DEBUGGING_GUIDE.md](RR_DEBUGGING_GUIDE.md) for concepts, workflows, and best practices.
 
-## Installation
-
-### Quick Install (with Claude Code or Claude Desktop)
-
-```bash
-# Clone and set up the repository
-git clone https://github.com/jnjaeschke/rr-mcp
-cd rr-mcp
-uv sync --all-extras
-
-# Add to your MCP configuration (use absolute path)
-mcp add rr-mcp --command uv --args run --directory "$(pwd)" rr-mcp
-
-# Restart Claude Desktop/Code to load the server
-```
-
 ## Requirements
 
+- Linux (rr only runs on Linux)
 - Python 3.11+
 - [rr](https://rr-project.org/) installed and in PATH
 - An rr recording to debug
 
+## Installation
+
+### Claude Code
+
+```bash
+claude mcp add rr-mcp -- uvx rr-mcp
+```
+
+### Claude Desktop
+
+Add to your [MCP config](https://modelcontextprotocol.io/quickstart/user):
+
+```json
+{
+  "mcpServers": {
+    "rr-mcp": {
+      "command": "uvx",
+      "args": ["rr-mcp"]
+    }
+  }
+}
+```
+
+### Other MCP clients
+
+Any MCP client that supports stdio servers can run `uvx rr-mcp` (or `pipx run rr-mcp`).
+
 ## Usage
 
-### With Claude Desktop/Code
-
-Once installed, the server loads automatically when you start Claude. You can verify it's working by asking:
+Once installed, the server loads automatically when you start your MCP client. Verify it's working by asking:
 
 > "List available rr traces"
 
 Claude will use the `traces_list` tool to show recordings in your `_RR_TRACE_DIR` (defaults to `~/.local/share/rr`).
-
-### Standalone
-
-Run the server directly (for testing or other MCP clients):
-
-```bash
-cd /path/to/rr-mcp
-uv run rr-mcp
-```
-
-The server communicates via stdio using the MCP protocol.
 
 ### Available Tools & Resources
 
