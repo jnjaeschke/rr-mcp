@@ -5,6 +5,8 @@ import atexit
 import json
 import logging
 import signal
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as pkg_version
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -138,8 +140,16 @@ def get_session_manager() -> SessionManager:
     return _session_manager
 
 
+def _get_version() -> str:
+    """Get the rr-mcp package version, falling back to 'dev' if not installed."""
+    try:
+        return pkg_version("rr-mcp")
+    except PackageNotFoundError:
+        return "dev"
+
+
 # Create the MCP server
-server = Server("rr-mcp")
+server = Server("rr-mcp", version=_get_version())
 
 
 @server.list_resources()  # type: ignore[no-untyped-call, untyped-decorator]
@@ -679,8 +689,7 @@ async def list_tools() -> list[Tool]:
                     "location": {
                         "type": "string",
                         "description": (
-                            "Where to break: 'function', "
-                            "'file.cpp:42', or '*0x12345678'"
+                            "Where to break: 'function', 'file.cpp:42', or '*0x12345678'"
                         ),
                     },
                     "condition": {
@@ -854,16 +863,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "count": {
                         "type": "integer",
-                                "description": (
-                            "Max frames to return (default: 20). "
-                            "Use higher for deep call stacks."
+                        "description": (
+                            "Max frames to return (default: 20). Use higher for deep call stacks."
                         ),
                     },
                     "full": {
                         "type": "boolean",
-                                "description": (
-                            "If true, include local variables "
-                            "for each frame (verbose but detailed)"
+                        "description": (
+                            "If true, include local variables for each frame (verbose but detailed)"
                         ),
                     },
                 },
@@ -966,8 +973,7 @@ async def list_tools() -> list[Tool]:
                     "frame_num": {
                         "type": "integer",
                         "description": (
-                            "Frame number: 0=current/innermost, "
-                            "1=caller, 2=caller's caller, etc."
+                            "Frame number: 0=current/innermost, 1=caller, 2=caller's caller, etc."
                         ),
                     },
                 },
@@ -1376,9 +1382,7 @@ async def list_tools() -> list[Tool]:
                     "size": {
                         "type": "string",
                         "description": (
-                            "Unit size: 'b' (byte), "
-                            "'h' (halfword), 'w' (word), "
-                            "'g' (giant)"
+                            "Unit size: 'b' (byte), 'h' (halfword), 'w' (word), 'g' (giant)"
                         ),
                         "enum": ["b", "h", "w", "g"],
                     },
@@ -1402,9 +1406,7 @@ async def list_tools() -> list[Tool]:
                     "subcommand": {
                         "type": "string",
                         "description": (
-                            "Info subcommand (e.g., "
-                            "'proc mappings', 'shared', "
-                            "'signals')"
+                            "Info subcommand (e.g., 'proc mappings', 'shared', 'signals')"
                         ),
                     },
                 },
