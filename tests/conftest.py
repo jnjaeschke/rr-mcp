@@ -10,16 +10,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # Check if rr is available at import time
-def _check_rr_available() -> bool:
-    """Check if rr is installed and available."""
-    return shutil.which("rr") is not None
+_rr_available = shutil.which("rr") is not None
 
-
-# Fail immediately if rr is not available
-if not _check_rr_available():
-    pytest.exit("rr is not installed or not in PATH. Cannot run tests.", returncode=1)
+# Mark integration fixtures so they skip when rr is not installed
+requires_rr = pytest.mark.skipif(not _rr_available, reason="rr is not installed")
 
 
 @pytest.fixture(scope="session")
@@ -37,6 +32,8 @@ def programs_dir(fixtures_dir: Path) -> Path:
 @pytest.fixture(scope="session")
 def build_programs(programs_dir: Path) -> None:
     """Build all test programs before running tests."""
+    if not _rr_available:
+        pytest.skip("rr is not installed")
     build_dir = programs_dir / "build"
     build_dir.mkdir(exist_ok=True)
 
