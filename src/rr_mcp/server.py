@@ -288,8 +288,9 @@ async def list_tools() -> list[Tool]:
             description=(
                 "List all processes in a trace with PID, parent PID, command, and exit status. "
                 "Essential for multi-process debugging to identify which PID to debug. "
-                "For multi-process apps: Child processes must have called "
-                "exec() to be debuggable with session_create. "
+                "For exec()d child processes, pass pid to session_create. "
+                "For forked-without-exec children (e.g. Firefox content processes), "
+                "pass fork_pid to session_create instead. "
                 "Returns: Array of process info with pid, ppid, command, exit_code fields."
             ),
             inputSchema={
@@ -325,8 +326,18 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": (
                             "Process ID to debug (from trace_processes). "
-                            "Omit to use rr's default "
-                            "(usually the main process)."
+                            "Must have called exec(). "
+                            "Omit to use rr's default (usually the main process). "
+                            "Mutually exclusive with fork_pid."
+                        ),
+                    },
+                    "fork_pid": {
+                        "type": "integer",
+                        "description": (
+                            "Start the debug server when this PID has been fork()d. "
+                            "Use for forked-without-exec child processes "
+                            "(e.g. Firefox content processes). "
+                            "Mutually exclusive with pid."
                         ),
                     },
                 },
@@ -988,7 +999,9 @@ async def list_tools() -> list[Tool]:
                 "values (rax), stack pointer (rsp), instruction "
                 "pointer (rip), or function arguments in "
                 "registers (rdi, rsi, rdx, rcx). "
-                "Returns: Dictionary mapping register name to hex value."
+                "Returns: Dictionary mapping register name to hex value. "
+                "By default returns only general-purpose registers to keep "
+                "output compact. Set all_registers=true to include SIMD/FP registers."
             ),
             inputSchema={
                 "type": "object",
@@ -996,6 +1009,13 @@ async def list_tools() -> list[Tool]:
                     "session_id": {
                         "type": "string",
                         "description": "Session ID",
+                    },
+                    "all_registers": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, return all registers including XMM/YMM/ZMM. "
+                            "Default false (GP registers only) to reduce output size."
+                        ),
                     },
                 },
                 "required": ["session_id"],
@@ -1563,13 +1583,22 @@ async def _handle_tool(name: str, arguments: dict[str, object]) -> dict[str, obj
         trace = str(trace_obj) if trace_obj is not None else None
         pid_obj = arguments.get("pid")
         pid = int(pid_obj) if pid_obj is not None and isinstance(pid_obj, (int, str)) else None
+        fork_pid_obj = arguments.get("fork_pid")
+        fork_pid = (
+            int(fork_pid_obj)
+            if fork_pid_obj is not None and isinstance(fork_pid_obj, (int, str))
+            else None
+        )
         trace_path = str(resolve_trace_path(trace))
 
-        session, initial_location = await manager.create_session(trace=trace_path, pid=pid)
+        session, initial_location = await manager.create_session(
+            trace=trace_path, pid=pid, fork_pid=fork_pid
+        )
         return {
             "session_id": session.session_id,
             "trace": session.trace,
             "pid": session.pid,
+            "fork_pid": session.fork_pid,
             "state": session.state.value,
             "initial_location": _location_to_dict(initial_location),
         }
@@ -1582,6 +1611,7 @@ async def _handle_tool(name: str, arguments: dict[str, object]) -> dict[str, obj
                     "session_id": s.session_id,
                     "trace": s.trace,
                     "pid": s.pid,
+                    "fork_pid": s.fork_pid,
                     "state": s.state.value,
                 }
                 for s in sessions
@@ -1816,7 +1846,9 @@ async def _handle_tool(name: str, arguments: dict[str, object]) -> dict[str, obj
 
     if name == "registers":
         session = manager.get_session(_get_str_arg(arguments, "session_id"))
-        registers = await session.read_registers()
+        all_registers = arguments.get("all_registers", False)
+        gp_only = not bool(all_registers)
+        registers = await session.read_registers(gp_only=gp_only)
         return {"registers": registers}
 
     if name == "examine_memory":
@@ -2009,15 +2041,27 @@ async def _handle_tool(name: str, arguments: dict[str, object]) -> dict[str, obj
     if name == "gdb_raw":
         session = manager.get_session(_get_str_arg(arguments, "session_id"))
         command = _get_str_arg(arguments, "command")
-        escaped = _mi_escape(command)
-        response = await session.execute(f'-interpreter-exec console "{escaped}"')
+        # MI commands (starting with "-") are sent directly; console commands
+        # are wrapped in -interpreter-exec console for proper execution.
+        if command.startswith("-"):
+            response = await session.execute(command)
+        else:
+            escaped = _mi_escape(command)
+            response = await session.execute(f'-interpreter-exec console "{escaped}"')
+        # Collect both console output and MI result payloads
         output_lines: list[str] = []
+        result_payload: dict[str, object] | None = None
         for record in response:
             if record.get("type") == "console":
                 payload = record.get("payload", "")
                 if isinstance(payload, str):
                     output_lines.append(payload)
-        return {"output": "".join(output_lines)}
+            elif record.get("type") == "result" and record.get("message") == "done":
+                result_payload = record.get("payload")
+        result_dict: dict[str, object] = {"output": "".join(output_lines)}
+        if result_payload is not None:
+            result_dict["result"] = result_payload
+        return result_dict
 
     raise RrMcpError(f"Unknown tool: {name}")
 

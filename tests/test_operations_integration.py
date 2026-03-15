@@ -213,6 +213,38 @@ async def test_watchpoint_operations(recorded_simple_trace: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pending_breakpoint_on_source_line(recorded_simple_trace: Path) -> None:
+    """Test that breakpoints can be set on source files before libraries load.
+
+    This tests the fix for pending breakpoints. GDB needs 'set breakpoint pending on'
+    to allow setting breakpoints on code that hasn't been loaded yet (e.g., at process
+    start before shared libraries are loaded).
+    """
+    manager = SessionManager()
+    session, _ = await manager.create_session(trace=str(recorded_simple_trace))
+
+    try:
+        # At process start (_start), shared libraries aren't loaded yet
+        # With pending breakpoints enabled, we should be able to set a breakpoint
+        # on functions that haven't been loaded yet
+        bp_data = await session.set_breakpoint("main")
+        assert bp_data is not None
+        assert bp_data.number is not None
+        assert bp_data.function is not None
+        assert "main" in bp_data.function
+
+        # Continue should hit the breakpoint
+        stop_result = await session.continue_execution()
+        assert stop_result is not None
+        assert stop_result.reason == "breakpoint-hit"
+        assert stop_result.location.function is not None
+        assert "main" in stop_result.location.function
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
 async def test_backtrace_and_frame_navigation(recorded_crash_trace: Path) -> None:
     """Test getting backtrace and navigating stack frames."""
     manager = SessionManager()
@@ -812,6 +844,56 @@ async def test_multi_process_breakpoint_in_child(recorded_fork_trace: Path) -> N
         location = await session.get_current_location()
         assert location.function is not None
         assert "child_process" in location.function or "child" in location.function.lower()
+
+    finally:
+        await manager.close_session(session.session_id)
+
+
+@pytest.mark.asyncio
+async def test_fork_pid_content_process(recorded_fork_no_exec_trace: Path) -> None:
+    """Test that -f <PID> (fork_pid) lets us debug a forked-without-exec child.
+
+    Mimics the Firefox parent/content-process model: the parent fork()s a child
+    that never calls exec(), so the child cannot be targeted with -p.  We use
+    fork_pid instead, which maps to rr replay -f <PID>.
+    """
+    processes = get_trace_processes(str(recorded_fork_no_exec_trace))
+
+    # The program has exactly two processes: parent and one forked child.
+    assert len(processes) == 2, f"Expected 2 processes, got {len(processes)}: {processes}"
+
+    # The process whose pid appears as another's ppid is the parent.
+    parent_pid = next(p.ppid for p in processes if p.ppid != 0)
+    child = next(p for p in processes if p.pid != parent_pid)
+
+    assert child.ppid == parent_pid, f"Expected child ppid={parent_pid}, got {child.ppid}"
+
+    manager = SessionManager()
+    # Use fork_pid — rr replay -f <child_pid>
+    session, _ = await manager.create_session(
+        trace=str(recorded_fork_no_exec_trace), fork_pid=child.pid
+    )
+
+    try:
+        # The child calls content_process_work(42); set a breakpoint there.
+        bp = await session.set_breakpoint("content_process_work")
+        assert bp is not None
+
+        stop = await session.continue_execution()
+        assert stop is not None, "Expected to hit breakpoint in content process"
+        assert stop.reason == "breakpoint-hit", f"Unexpected stop reason: {stop.reason}"
+
+        location = await session.get_current_location()
+        assert location.function is not None
+        assert "content_process_work" in location.function
+
+        # Verify we're actually in the child by inspecting the 'secret' argument.
+        args = await session.get_function_arguments()
+        assert args, "Expected function arguments"
+        flat_args = args[0] if args else []
+        secret_arg = next((v for v in flat_args if v.name == "secret"), None)
+        assert secret_arg is not None, "Expected 'secret' argument"
+        assert secret_arg.value == "42", f"Expected secret=42, got {secret_arg.value}"
 
     finally:
         await manager.close_session(session.session_id)

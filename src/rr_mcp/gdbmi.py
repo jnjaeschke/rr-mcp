@@ -109,6 +109,30 @@ class GdbMi:
         self._lock = asyncio.Lock()
         self._register_names: list[str] | None = None
 
+    def is_process_alive(self) -> bool:
+        """Check if the underlying rr/GDB process is still running."""
+        proc = self._gdb.gdb_process
+        return proc is not None and proc.poll() is None
+
+    def get_process_exit_info(self) -> tuple[int | None, str]:
+        """Get exit code and stderr from a dead rr/GDB process.
+
+        Returns:
+            Tuple of (return_code, stderr_text). Returns (None, "") if process
+            is still alive or unavailable.
+        """
+        proc = self._gdb.gdb_process
+        if proc is None or proc.poll() is None:
+            return (None, "")
+        stderr = ""
+        if proc.stderr is not None:
+            try:
+                raw = proc.stderr.read()
+                stderr = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+            except Exception:
+                pass
+        return (proc.returncode, stderr)
+
     async def execute_raw(self, command: str, timeout_sec: int = 30) -> list[GdbMiRecord]:
         """Execute a raw GDB/MI command.
 
@@ -153,9 +177,50 @@ class GdbMi:
         deadline = time.monotonic() + timeout_sec
 
         def _has_stop(records: list[GdbMiRecord]) -> bool:
-            return any(
-                r.get("type") == "notify" and r.get("message") in stop_messages for r in records
-            )
+            """Check if records contain a stop notification.
+
+            Checks for:
+            - notify with message in {stopped, thread-exited, exited}
+            - result with message "exit" (process terminated)
+            - result with message "error" containing "not being run" (already ended)
+            """
+            for r in records:
+                msg_type = r.get("type")
+                message = r.get("message")
+
+                # Standard stop notifications
+                if msg_type == "notify" and message in stop_messages:
+                    return True
+
+                # Process exit via result
+                if msg_type == "result" and message == "exit":
+                    return True
+
+                # Error indicating process already ended
+                if msg_type == "result" and message == "error":
+                    payload = r.get("payload") or {}
+                    error_msg = payload.get("msg", "")
+                    if "not being run" in error_msg or "terminated" in error_msg:
+                        logger.debug("Detected process termination via error: %s", error_msg)
+                        return True
+
+                # Console messages that might indicate completion
+                if msg_type == "console":
+                    console_output = r.get("payload", "")
+                    if isinstance(console_output, str):
+                        lower_output = console_output.lower()
+                        if (
+                            "exited" in lower_output
+                            or "terminated" in lower_output
+                            or "program terminated" in lower_output
+                        ):
+                            logger.debug(
+                                "Detected possible termination via console: %s", console_output
+                            )
+                            # Don't return True here - console messages are informational
+                            # Continue checking for actual notify
+
+            return False
 
         while True:
             remaining = deadline - time.monotonic()
@@ -180,11 +245,42 @@ class GdbMi:
 
             all_records.extend(records)
 
+            # Log records for debugging (only non-empty batches)
+            if records:
+                logger.debug(
+                    "_wait_for_stop: received %d records, types: %s",
+                    len(records),
+                    [f"{r.get('type')}:{r.get('message')}" for r in records],
+                )
+
             if _has_stop(records):
                 return all_records
 
-        # Timeout expired without stop — send interrupt to recover the session
-        logger.warning("_wait_for_stop: timeout after %ds, sending -exec-interrupt", timeout_sec)
+        # Timeout expired without stop
+        # Before interrupting, check if we actually reached end of trace by checking current event
+        logger.warning(
+            "_wait_for_stop: timeout after %ds, checking if process completed", timeout_sec
+        )
+
+        # Try to check current position - if event=0, we're at the end
+        try:
+            event, _ = await self.rr_when()
+            if event == 0:
+                logger.info("_wait_for_stop: detected end of trace (event=0)")
+                # Process ran to completion - synthesize a stop record
+                all_records.append(
+                    {
+                        "type": "notify",
+                        "message": "stopped",
+                        "payload": {"reason": "end-of-recording"},
+                    }
+                )
+                return all_records
+        except Exception:
+            logger.debug("_wait_for_stop: could not check position", exc_info=True)
+
+        # If not at end, try to interrupt to regain control
+        logger.warning("_wait_for_stop: sending -exec-interrupt to regain control")
         try:
             interrupt_records = await self.exec_interrupt()
             all_records.extend(interrupt_records)
@@ -346,7 +442,7 @@ class GdbMi:
         # Check for GDB error responses
         for record in response:
             if record.get("type") == "result" and record.get("message") == "error":
-                error_msg = record.get("payload", {}).get("msg", "unknown error")
+                error_msg = (record.get("payload") or {}).get("msg", "unknown error")
                 raise GdbError(f"rr when command failed: {error_msg}")
 
         for record in response:
@@ -450,7 +546,7 @@ class GdbMi:
         Returns:
             Breakpoint data, or None if failed.
         """
-        cmd = "-break-insert"
+        cmd = "-break-insert -f"  # -f allows pending breakpoints
         if temporary:
             cmd += " -t"
         if condition:
@@ -461,7 +557,8 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                bkpt = record.get("payload", {}).get("bkpt", {})
+                # Handle case where payload or bkpt key exists but has None value
+                bkpt = (record.get("payload") or {}).get("bkpt") or {}
                 return BreakpointData(
                     number=_safe_int(bkpt.get("number")),
                     type=bkpt.get("type"),
@@ -522,7 +619,8 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                table = record.get("payload", {}).get("BreakpointTable", {})
+                # Handle case where payload or BreakpointTable key exists but has None value
+                table = (record.get("payload") or {}).get("BreakpointTable") or {}
                 body = table.get("body", [])
                 for bkpt in body:
                     bp_type = bkpt.get("type", "")
@@ -575,9 +673,27 @@ class GdbMi:
 
         response = await self.execute_raw(cmd)
 
+        # Check for error response first
+        for record in response:
+            if record.get("type") == "result" and record.get("message") == "error":
+                error_payload = record.get("payload") or {}
+                error_msg = error_payload.get("msg", "Unknown error")
+                # Provide more helpful error for common watchpoint issues
+                if "register" in error_msg.lower() or "not in memory" in error_msg.lower():
+                    from rr_mcp.errors import GdbError
+
+                    raise GdbError(
+                        f"Cannot set watchpoint on '{expression}': {error_msg}. "
+                        "Watchpoints require memory-backed variables. The variable may be "
+                        "optimized into a register or not yet in scope."
+                    )
+                from rr_mcp.errors import GdbError
+
+                raise GdbError(f"Failed to set watchpoint on '{expression}': {error_msg}")
+
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                payload = record.get("payload", {})
+                payload = record.get("payload") or {}
                 # Try different watchpoint key names that GDB uses
                 wpt = (
                     payload.get("wpt")
@@ -616,7 +732,8 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                frame = record.get("payload", {}).get("frame", {})
+                # Handle case where payload or frame key exists but has None value
+                frame = (record.get("payload") or {}).get("frame") or {}
                 return FrameData(
                     level=_safe_int(frame.get("level")),
                     function=frame.get("func"),
@@ -643,7 +760,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                stack = record.get("payload", {}).get("stack", [])
+                stack = (record.get("payload") or {}).get("stack", [])
                 for frame_data in stack:
                     frame = frame_data.get("frame", frame_data)
                     frames.append(
@@ -684,7 +801,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                var_list = record.get("payload", {}).get("variables", [])
+                var_list = (record.get("payload") or {}).get("variables", [])
                 for var in var_list:
                     variables.append(
                         VariableData(
@@ -717,7 +834,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                stack_args = record.get("payload", {}).get("stack-args", [])
+                stack_args = (record.get("payload") or {}).get("stack-args", [])
                 for frame_args in stack_args:
                     args = frame_args.get("args", [])
                     frame_vars = []
@@ -751,7 +868,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                return record.get("payload", {}).get("value")
+                return (record.get("payload") or {}).get("value")
         return None
 
     async def data_read_memory_bytes(self, address: str, size: int) -> MemoryBlock | None:
@@ -768,7 +885,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                memory = record.get("payload", {}).get("memory", [])
+                memory = (record.get("payload") or {}).get("memory", [])
                 if memory:
                     block = memory[0]
                     contents_hex = block.get("contents", "")
@@ -808,26 +925,33 @@ class GdbMi:
                 if not isinstance(payload, str):
                     continue
                 output = payload
-                # Parse output like "0x12345: 0xdeadbeef  0xcafebabe"
+                # Parse output format depends on format_char
                 for line in output.splitlines():
-                    # Match address at start
-                    match = re.match(r"(0x[0-9a-fA-F]+):\s+(.*)", line)
+                    # Match address at start - format: "0x12345: <rest>"
+                    # For instruction format, the line might have <symbol+offset> before the colon
+                    match = re.match(r"(0x[0-9a-fA-F]+)(?:\s+<[^>]+>)?:\s+(.*)", line)
                     if match:
                         addr = match.group(1)
-                        values_str = match.group(2)
-                        # Split values
-                        values = values_str.split()
-                        for val in values:
-                            if val:  # Skip empty
-                                results.append((addr, val))
-                                # Update address for next value
-                                try:
-                                    addr_int = int(addr, 16)
-                                    unit_bytes = {"b": 1, "h": 2, "w": 4, "g": 8}.get(size, 4)
-                                    addr_int += unit_bytes
-                                    addr = f"0x{addr_int:x}"
-                                except ValueError:
-                                    pass
+                        values_str = match.group(2).strip()
+
+                        if format_char == "i":
+                            # For instruction format, keep the entire line as one value
+                            if values_str:
+                                results.append((addr, values_str))
+                        else:
+                            # For other formats, split by whitespace as before
+                            values = values_str.split()
+                            for val in values:
+                                if val:  # Skip empty
+                                    results.append((addr, val))
+                                    # Update address for next value
+                                    try:
+                                        addr_int = int(addr, 16)
+                                        unit_bytes = {"b": 1, "h": 2, "w": 4, "g": 8}.get(size, 4)
+                                        addr_int += unit_bytes
+                                        addr = f"0x{addr_int:x}"
+                                    except ValueError:
+                                        pass
 
         return results
 
@@ -844,7 +968,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                payload = record.get("payload", {})
+                payload = record.get("payload") or {}
                 if isinstance(payload, dict):
                     names_raw = payload.get("register-names", [])
                     if isinstance(names_raw, list):
@@ -854,11 +978,25 @@ class GdbMi:
 
         return []
 
-    async def data_list_register_values(self, format_char: str = "x") -> list[RegisterValue]:
-        """Get values of all registers.
+    # x86-64 general-purpose and commonly useful registers.
+    # Filtering to these avoids returning huge SIMD register values.
+    _GP_REGISTERS = frozenset({
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        "rip", "eflags",
+        # 32-bit equivalents for 32-bit binaries
+        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip",
+    })
+
+    async def data_list_register_values(
+        self, format_char: str = "x", gp_only: bool = False
+    ) -> list[RegisterValue]:
+        """Get values of registers.
 
         Args:
             format_char: Format for values ("x"=hex, "d"=decimal, etc.).
+            gp_only: If True, only return general-purpose registers
+                (rax..r15, rip, eflags) to reduce output size.
 
         Returns:
             List of register values with names.
@@ -871,15 +1009,18 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                values = record.get("payload", {}).get("register-values", [])
+                values = (record.get("payload") or {}).get("register-values", [])
                 for reg in values:
                     number = reg.get("number")
                     value = reg.get("value")
                     if number is not None and value is not None:
                         idx = int(number)
                         name = names[idx] if idx < len(names) else f"r{idx}"
-                        if name:  # Skip empty register names
-                            registers.append(RegisterValue(name=name, value=value))
+                        if not name:  # Skip empty register names
+                            continue
+                        if gp_only and name not in self._GP_REGISTERS:
+                            continue
+                        registers.append(RegisterValue(name=name, value=value))
 
         return registers
 
@@ -899,7 +1040,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                payload = record.get("payload", {})
+                payload = record.get("payload") or {}
                 current_thread = _safe_int(payload.get("current-thread-id"))
 
                 for thread in payload.get("threads", []):
@@ -914,10 +1055,23 @@ class GdbMi:
                             address=frame_data.get("addr"),
                         )
 
+                    # Resolve thread name from multiple possible fields:
+                    # 1. "name" — explicit GDB thread name (often null)
+                    # 2. "details" — rr puts the thread name here
+                    # 3. "target-id" — standard GDB parenthesized suffix
+                    thread_name = thread.get("name")
+                    if not thread_name:
+                        thread_name = thread.get("details")
+                    if not thread_name:
+                        target_id = thread.get("target-id", "")
+                        paren_match = re.search(r"\(([^)]+)\)\s*$", target_id)
+                        if paren_match:
+                            thread_name = paren_match.group(1)
+
                     threads.append(
                         ThreadData(
                             id=_safe_int(thread.get("id")) or 0,
-                            name=thread.get("name"),
+                            name=thread_name,
                             state=thread.get("state"),
                             frame=frame,
                         )
@@ -938,7 +1092,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                frame = record.get("payload", {}).get("frame", {})
+                frame = (record.get("payload") or {}).get("frame", {})
                 if frame:
                     return FrameData(
                         level=_safe_int(frame.get("level")),
@@ -964,7 +1118,7 @@ class GdbMi:
 
         for record in response:
             if record.get("type") == "result" and record.get("message") == "done":
-                file_list = record.get("payload", {}).get("files", [])
+                file_list = (record.get("payload") or {}).get("files", [])
                 for file_info in file_list:
                     if isinstance(file_info, dict):
                         fullname = file_info.get("fullname")
@@ -1190,7 +1344,17 @@ class GdbMi:
         cmd = " ".join(parts)
         escaped = _mi_escape(cmd)
         response = await self.execute_raw(f'-interpreter-exec console "{escaped}"')
-        return _extract_console_output(response)
+        # Filter output to only signal-table lines — GDB may include buffered
+        # startup messages (library loading, banner text) in the console output.
+        raw = _extract_console_output(response)
+        filtered: list[str] = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            # Keep the header ("Signal  Stop  Print  Pass to program  Description")
+            # and signal rows ("SIGxxx  Yes/No  Yes/No  Yes/No  description")
+            if stripped.startswith("Signal") or stripped.startswith("SIG"):
+                filtered.append(line)
+        return "\n".join(filtered)
 
     # -------------------------------------------------------------------------
     # Memory search

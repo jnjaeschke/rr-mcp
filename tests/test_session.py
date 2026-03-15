@@ -133,6 +133,10 @@ class TestSession:
         with patch("rr_mcp.session.GdbController") as MockGdbController:
             mock_instance = MagicMock()
             mock_instance.write = MagicMock(return_value=[{"type": "result", "message": "done"}])
+            mock_instance.gdb_process.poll.return_value = None  # process alive
+            mock_instance.get_gdb_response.return_value = [
+                {"type": "result", "message": "done", "payload": None}
+            ]
             MockGdbController.return_value = mock_instance
 
             await session.start()
@@ -155,6 +159,10 @@ class TestSession:
         with patch("rr_mcp.session.GdbController") as MockGdbController:
             mock_instance = MagicMock()
             mock_instance.write = MagicMock(return_value=[{"type": "result", "message": "done"}])
+            mock_instance.gdb_process.poll.return_value = None  # process alive
+            mock_instance.get_gdb_response.return_value = [
+                {"type": "result", "message": "done", "payload": None}
+            ]
             mock_instance.exit = MagicMock()
             MockGdbController.return_value = mock_instance
 

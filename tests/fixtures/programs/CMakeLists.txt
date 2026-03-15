@@ -15,6 +15,7 @@ add_executable(threads threads.cpp)
 add_executable(recursive recursive.cpp)
 add_executable(fork_test fork_test.cpp)
 add_executable(cpp_features cpp_features.cpp)
+add_executable(fork_no_exec fork_no_exec.cpp)
 
 # Link pthread for threads program
 target_link_libraries(threads PRIVATE pthread)

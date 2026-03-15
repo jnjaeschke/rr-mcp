@@ -24,6 +24,14 @@ from rr_mcp.models import (
 
 logger = logging.getLogger(__name__)
 
+
+def _as_str(value: object) -> str:
+    """Coerce a value to str.  If *value* is a list, return the last element."""
+    if isinstance(value, list):
+        return str(value[-1]) if value else ""
+    return str(value) if value is not None else ""
+
+
 # Default maximum number of concurrent sessions
 DEFAULT_MAX_SESSIONS = 10
 
@@ -34,16 +42,23 @@ class Session:
     Each session wraps a single rr replay process communicating via GDB/MI.
     """
 
-    def __init__(self, trace: str, pid: int | None = None) -> None:
+    def __init__(self, trace: str, pid: int | None = None, fork_pid: int | None = None) -> None:
         """Initialize a session.
 
         Args:
             trace: Path to the rr trace.
-            pid: Process ID to debug (None for rr default).
+            pid: Process ID to debug (None for rr default). Requires the process
+                to have called exec().
+            fork_pid: Start the debug server when this PID has been fork()d.
+                Use for forked-without-exec child processes (e.g. Firefox content
+                processes). Mutually exclusive with pid.
         """
+        if pid is not None and fork_pid is not None:
+            raise RrMcpError("pid and fork_pid are mutually exclusive")
         self.session_id: str = str(uuid.uuid4())
         self.trace: str = trace
         self.pid: int | None = pid
+        self.fork_pid: int | None = fork_pid
         self.state: SessionState = SessionState.PAUSED
         self._gdb: GdbMi | None = None
 
@@ -59,6 +74,8 @@ class Session:
 
         if self.pid is not None:
             command.extend(["-p", str(self.pid)])
+        elif self.fork_pid is not None:
+            command.extend(["-f", str(self.fork_pid)])
 
         command.append(self.trace)
 
@@ -72,11 +89,17 @@ class Session:
         self._gdb = GdbMi(controller)
 
         try:
-            # Flush initial GDB output by executing a harmless command
-            await self._read_until_ready()
+            # Flush initial GDB output by executing a harmless command.
+            # With -f (fork_pid), rr replays the entire trace forward until the
+            # target fork() event, which can take minutes for large traces.
+            startup_timeout = 300 if self.fork_pid is not None else 30
+            await self._read_until_ready(timeout_sec=startup_timeout)
 
             # Enable pretty-printers for STL containers etc.
             await self._gdb.enable_pretty_printing()
+
+            # Enable pending breakpoints so breakpoints can be set before libraries load
+            await self._gdb.execute_raw("-gdb-set breakpoint pending on")
 
             # Get initial location
             return await self.get_current_location()
@@ -110,13 +133,62 @@ class Session:
 
         return await self._gdb.execute_raw(command)
 
-    async def _read_until_ready(self) -> list[GdbMiRecord]:
-        """Flush GDB's initial output by executing a harmless command."""
+    async def _read_until_ready(self, timeout_sec: int = 30) -> list[GdbMiRecord]:
+        """Wait for rr/GDB to become ready, then flush initial output.
+
+        For -f (fork_pid) sessions, rr replays the trace forward before starting
+        GDB, which can take minutes.  This method periodically checks whether the
+        rr process is still alive so that crashes (e.g. replay divergence on a
+        stale trace) are detected immediately instead of after a long timeout.
+        """
         if self._gdb is None:
             return []
 
-        # Execute a harmless command to trigger GDB initialization
-        return await self._gdb.execute_raw("-gdb-show version", timeout_sec=10)
+        import time
+
+        deadline = time.monotonic() + timeout_sec
+        loop = asyncio.get_running_loop()
+        all_records: list[GdbMiRecord] = []
+
+        while True:
+            # Check if the rr process died (e.g. stale trace, replay divergence)
+            if not self._gdb.is_process_alive():
+                rc, stderr = self._gdb.get_process_exit_info()
+                # Extract the most useful lines from stderr
+                error_lines = [
+                    ln
+                    for ln in stderr.splitlines()
+                    if any(tag in ln for tag in ("[FATAL", "[ERROR", "Assertion", "divergence"))
+                ]
+                summary = "\n".join(error_lines) if error_lines else stderr[-2000:]
+                raise RrMcpError(f"rr process exited with code {rc} before GDB started:\n{summary}")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RrMcpError(f"Timeout waiting for rr/GDB to start after {timeout_sec} seconds")
+
+            # Try reading output with a short timeout so we can recheck liveness
+            poll_sec = min(2, int(remaining) or 1)
+            try:
+                records: list[GdbMiRecord] = await loop.run_in_executor(
+                    None,
+                    lambda t=poll_sec: self._gdb._gdb.get_gdb_response(  # type: ignore[misc,arg-type]
+                        timeout_sec=t,
+                        raise_error_on_timeout=True,
+                    ),
+                )
+                all_records.extend(records)
+
+                # Got output — GDB has started.  Send a command to flush remaining init.
+                flush = await self._gdb.execute_raw("-gdb-show version", timeout_sec=10)
+                all_records.extend(flush)
+                return all_records
+            except Exception:
+                # Timeout reading — loop around to check liveness again
+                pass
+
+            # Yield to the event loop so we don't busy-spin
+            await asyncio.sleep(0.2)
 
     async def get_current_position(self) -> tuple[int, int]:
         """Get the current event and tick position.
@@ -180,65 +252,79 @@ class Session:
     async def _parse_stop_result(self, records: list[GdbMiRecord]) -> StopResult | None:
         """Parse a stop result from GDB/MI records and populate event/tick.
 
+        Uses the LAST stopped notification when multiple are present. This
+        handles cases where intermediate signals (e.g. SIGSYS in Firefox
+        content processes) produce transient stops before the real stop.
+
         Args:
             records: List of GDB/MI response records.
 
         Returns:
             StopResult if a stop was found, None otherwise.
         """
-        # Look for stop notifications (stopped, thread-exited, exited)
+        # Find the LAST stop notification — earlier ones may be transient
+        # signal stops that were immediately resumed.
+        last_stop: GdbMiRecord | None = None
         for record in records:
             if record.get("type") == "notify" and record.get("message") in (
                 "stopped",
                 "thread-exited",
                 "exited",
             ):
-                payload = record.get("payload", {})
+                last_stop = record
 
-                # Get current position — may fail in transient GDB states
-                try:
-                    event, tick = await self.get_current_position()
-                except GdbError:
-                    logger.debug("_parse_stop_result: rr when failed, using (0,0)")
-                    event, tick = 0, 0
+        if last_stop is not None:
+            # Handle case where payload itself might be None
+            payload = last_stop.get("payload") or {}
 
-                # Extract signal info if present
-                signal_info = None
-                if payload.get("signal-name"):
-                    signal_info = SignalInfo(
-                        name=payload.get("signal-name", ""),
-                        meaning=payload.get("signal-meaning", ""),
-                    )
+            # Get current position — may fail in transient GDB states
+            try:
+                event, tick = await self.get_current_position()
+            except GdbError:
+                logger.debug("_parse_stop_result: rr when failed, using (0,0)")
+                event, tick = 0, 0
 
-                frame = payload.get("frame", {})
-
-                # Get reason - if not present, infer from context
-                reason = payload.get("reason")
-                if not reason:
-                    # For reverse operations, GDB sometimes doesn't include reason
-                    # Default to "end-stepping-range" which is most common
-                    reason = "end-stepping-range"
-
-                return StopResult(
-                    reason=reason,
-                    location=Location(
-                        event=event,
-                        tick=tick,
-                        function=frame.get("func"),
-                        file=frame.get("file"),
-                        line=_safe_int(frame.get("line")),
-                        address=frame.get("addr", "0x0"),
-                    ),
-                    signal=signal_info,
-                    breakpoint_id=_safe_int(payload.get("bkptno")),
+            # Extract signal info if present
+            signal_info = None
+            sig_name = payload.get("signal-name")
+            if sig_name:
+                signal_info = SignalInfo(
+                    name=_as_str(sig_name),
+                    meaning=_as_str(payload.get("signal-meaning", "")),
                 )
+
+            # Handle case where frame key exists but has None value
+            frame = payload.get("frame") or {}
+
+            # Get reason - if not present, infer from context
+            reason = payload.get("reason")
+            if not reason:
+                # For reverse operations, GDB sometimes doesn't include reason
+                # Default to "end-stepping-range" which is most common
+                reason = "end-stepping-range"
+
+            return StopResult(
+                reason=_as_str(reason),
+                location=Location(
+                    event=event,
+                    tick=tick,
+                    function=frame.get("func"),
+                    file=frame.get("file"),
+                    line=_safe_int(frame.get("line")),
+                    address=frame.get("addr", "0x0"),
+                ),
+                signal=signal_info,
+                breakpoint_id=_safe_int(payload.get("bkptno")),
+            )
 
         # If no stopped notification found, check for "done" result with frame info
         # This can happen with some GDB configurations
         for record in records:
             if record.get("type") == "result" and record.get("message") == "done":
-                payload = record.get("payload", {})
-                frame = payload.get("frame", {})
+                # Handle case where payload itself might be None
+                payload = record.get("payload") or {}
+                # Handle case where frame key exists but has None value
+                frame = payload.get("frame") or {}
 
                 # Only create StopResult if we have frame information
                 if frame:
@@ -643,8 +729,13 @@ class Session:
             return []
         return await self._gdb.data_examine_memory(address, count, format_char, unit_size)
 
-    async def read_registers(self) -> dict[str, str]:
-        """Read all CPU registers.
+    async def read_registers(self, gp_only: bool = False) -> dict[str, str]:
+        """Read CPU registers.
+
+        Args:
+            gp_only: If True, only return general-purpose registers
+                (rax..r15, rip, eflags) to reduce output size. Recommended
+                for LLM clients to avoid huge SIMD register values.
 
         Returns:
             Dictionary mapping register names to values (as hex strings).
@@ -652,7 +743,7 @@ class Session:
         if self._gdb is None:
             return {}
 
-        registers = await self._gdb.data_list_register_values()
+        registers = await self._gdb.data_list_register_values(gp_only=gp_only)
         return {reg.name: reg.value for reg in registers}
 
     async def evaluate_expression(self, expression: str) -> str | None:
@@ -762,7 +853,13 @@ class Session:
                 if not isinstance(payload, str):
                     continue
                 output = payload
+
+                # Log the output for debugging
+                if output.strip():
+                    logger.debug("Checkpoint list output: %s", output)
+
                 for line in output.splitlines():
+                    # Try matching with both event and tick
                     match = re.match(r"\s*(\d+)\s+.*event\s+(\d+).*tick\s+(\d+)", line)
                     if match:
                         checkpoints.append(
@@ -783,6 +880,9 @@ class Session:
                                     tick=0,
                                 )
                             )
+                        elif line.strip() and not line.startswith("Num"):
+                            # Log lines that don't match either pattern (but skip header)
+                            logger.warning("Could not parse checkpoint line: %s", line)
 
         return checkpoints
 
@@ -978,12 +1078,15 @@ class SessionManager:
         self,
         trace: str,
         pid: int | None = None,
+        fork_pid: int | None = None,
     ) -> tuple[Session, Location]:
         """Create a new replay session.
 
         Args:
             trace: Path to the rr trace.
-            pid: Process ID to debug (None for rr default).
+            pid: Process ID to debug (None for rr default). Requires exec().
+            fork_pid: Start debug server when this PID is fork()d. For
+                forked-without-exec child processes. Mutually exclusive with pid.
 
         Returns:
             Tuple of (session, initial_location).
@@ -997,7 +1100,7 @@ class SessionManager:
                 "Close an existing session before creating a new one."
             )
 
-        session = Session(trace=trace, pid=pid)
+        session = Session(trace=trace, pid=pid, fork_pid=fork_pid)
         initial_location = await session.start()
         self._sessions[session.session_id] = session
         return (session, initial_location)

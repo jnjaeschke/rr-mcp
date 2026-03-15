@@ -181,6 +181,17 @@ def recorded_fork_trace(
 
 
 @pytest.fixture(scope="session")
+def recorded_fork_no_exec_trace(
+    build_programs: None,
+    programs_dir: Path,
+    session_trace_dir: Path,
+) -> Path:
+    """Record a trace of fork_no_exec (parent forks child that never exec()s)."""
+    program = programs_dir / "build" / "fork_no_exec"
+    return record_trace(program, session_trace_dir, "fork-no-exec-trace")
+
+
+@pytest.fixture(scope="session")
 def recorded_cpp_features_trace(
     build_programs: None,
     programs_dir: Path,
